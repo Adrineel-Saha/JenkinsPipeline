@@ -1,0 +1,167 @@
+pipeline {
+  agent any
+
+  environment {
+    // Tool names must exist in Jenkins Global Tool Configuration
+    JDK_HOME = tool name: 'JDK17', type: 'jdk'
+    MVN_HOME = tool name: 'Maven3', type: 'maven'
+    // CFG_PORT will be resolved from application.yml
+  }
+
+  stages {
+
+    stage('Clone Repository') {
+      steps {
+        git url: 'https://github.com/Adrineel-Saha/ConfigServer.git', branch: 'main'
+      }
+    }
+
+    stage('Read Port from application.yml') {
+      steps {
+        script {
+          def ymlPath = 'src/main/resources/application.yml'
+          if (!fileExists(ymlPath)) error "application.yml not found at ${ymlPath}"
+
+          def yml = readFile ymlPath
+          def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
+
+          if (m.find()) {
+            env.CFG_PORT = m.group(1)
+            echo "Using server.port from application.yml: ${env.CFG_PORT}"
+          } else {
+            error "server.port not found — define under server:\n  port: <number>"
+          }
+        }
+      }
+    }
+
+    // ---------------------------------------
+    // 🔴 FIX #1 — Kill before Build
+    // ---------------------------------------
+    stage('Kill Old Instance') {
+      steps {
+        bat '''
+          @echo on
+          echo === Kill: looking for process on :%CFG_PORT% ===
+          set "FOUND="
+          for /f "tokens=5" %%p in (
+            'netstat -ano ^| findstr /r /c:":%CFG_PORT%[ ]"'
+          ) do (
+            set FOUND=1
+            echo Found PID: %%p - killing
+            taskkill /F /PID %%p >nul 2>&1
+          )
+          if not defined FOUND echo No process found
+          exit /b 0
+        '''
+      }
+    }
+
+    // ---------------------------------------
+    // 🟢 FIX #2 — Wrapper-first, robust build
+    // ---------------------------------------
+    stage('Build') {
+      steps {
+        withEnv([
+          "JAVA_HOME=${env.JDK_HOME}",
+          "M2_HOME=${env.MVN_HOME}",
+          "PATH+JAVA=${env.JDK_HOME}\\bin",
+          "PATH+MAVEN=${env.MVN_HOME}\\bin"
+        ]) {
+
+          script {
+            bat 'echo === Build: env check ==='
+            bat '"%JAVA_HOME%\\bin\\java.exe" -version'
+            bat '"%M2_HOME%\\bin\\mvn.cmd" -v'
+
+            bat 'echo Current dir: %CD% & dir /b & if exist pom.xml (echo Found pom.xml)'
+
+            // Determine mvn command safely in Groovy
+            def mvnCmd = fileExists('mvnw.cmd')
+                    ? 'mvnw.cmd'
+                    : '"%M2_HOME%\\bin\\mvn.cmd"'
+
+            // Clean target
+            bat 'if exist target rmdir /s /q target'
+
+            // Run build
+            bat "call ${mvnCmd} -B -e -U clean package"
+
+            // Verify artifact
+            bat 'if not exist target (echo ERROR: target not created & exit /b 1)'
+            bat 'dir target'
+            bat 'if not exist target\\*.jar (echo ERROR: no jar created & exit /b 1)'
+          }
+        }
+      }
+    }
+
+    // ---------------------------------------
+    // 🟢 FIX #3 — Run from a COPY, not target/
+    // ---------------------------------------
+    stage('Run Config Server') {
+      steps {
+        withEnv([
+          "JAVA_HOME=${env.JDK_HOME}",
+          "PATH+JAVA=${env.JDK_HOME}\\bin"
+        ]) {
+
+          bat '''
+            @echo on
+            echo === Resolve built JAR ===
+
+            set "SRC_JAR="
+            for %%f in (target\\*.jar) do set SRC_JAR=%%~ff
+
+            if not defined SRC_JAR (
+              echo ERROR: No jar in target
+              exit /b 1
+            )
+
+            echo SRC_JAR = %SRC_JAR%
+
+            rem Prepare run folder
+            if exist run rmdir /s /q run
+            mkdir run
+
+            echo Copying jar to run ConfigServer.jar
+            copy /Y "%SRC_JAR%" run\\ConfigServer.jar
+
+            rem Prevent Jenkins killing the process
+            set BUILD_ID=dontKillMe
+            set JENKINS_NODE_COOKIE=do_not_kill
+
+            echo === Start ConfigServer DETACHED on port %CFG_PORT% ===
+            start "" /b "%JAVA_HOME%\\bin\\java.exe" -jar "%CD%\\run\\ConfigServer.jar" --server.port=%CFG_PORT%
+
+            echo === Wait for HTTP startup ===
+            set COUNT=0
+            :wait_loop
+            set /a COUNT+=1
+            ping -n 2 127.0.0.1 >nul
+
+            curl -s -o NUL http://127.0.0.1:%CFG_PORT%/
+            if not errorlevel 1 goto up
+
+            if %COUNT% GEQ 60 goto fail
+            goto wait_loop
+
+            :up
+            echo SUCCESS: ConfigServer is running on port %CFG_PORT%
+            exit /b 0
+
+            :fail
+            echo ERROR: ConfigServer did not start within 60 seconds.
+            exit /b 1
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      echo "Pipeline finished (port ${env.CFG_PORT}). ConfigServer running from run/ folder."
+    }
+  }
+}
