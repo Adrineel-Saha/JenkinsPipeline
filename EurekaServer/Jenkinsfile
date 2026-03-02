@@ -1,0 +1,155 @@
+pipeline {
+  agent any
+
+  environment {
+    // Tool names must exist in Jenkins Global Tool Configuration
+    JDK_HOME = tool name: 'JDK17',  type: 'jdk'
+    MVN_HOME = tool name: 'Maven3', type: 'maven'
+    // EUREKA_PORT will be set dynamically after reading application.yml
+  }
+
+  stages {
+
+    stage('Clone Repository') {
+      steps {
+        git url: 'https://github.com/Adrineel-Saha/EurekaServer.git', branch: 'main'
+      }
+    }
+
+    stage('Read Port from application.yml') {
+      steps {
+        script {
+          def ymlPath = 'src/main/resources/application.yml'
+          if (!fileExists(ymlPath)) {
+            error "application.yml not found at ${ymlPath}"
+          }
+          def yml = readFile ymlPath
+
+          // Match:
+          // server:
+          //   port: <digits>
+          def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
+          if (m.find()) {
+            env.EUREKA_PORT = m.group(1)
+            echo "Using server.port from application.yml: ${env.EUREKA_PORT}"
+          } else {
+            error "server.port not found in ${ymlPath}. Please define it under 'server:\\n  port: <number>'."
+          }
+        }
+      }
+    }
+
+    // Move kill BEFORE build
+    stage('Kill Old Instance') {
+      steps {
+        bat '''
+          @echo on
+          echo === Kill (pre-build): looking for process on :%EUREKA_PORT% ===
+          set "FOUND="
+          for /f "tokens=5" %%p in ('netstat -ano ^| findstr /r /c:":%EUREKA_PORT%[ ]"') do (
+            set "FOUND=1"
+            echo Found PID: %%p on :%EUREKA_PORT% - attempting kill
+            taskkill /F /PID %%p >nul 2>&1
+          )
+          if not defined FOUND (
+            echo No process found on :%EUREKA_PORT% (nothing to kill)
+          )
+          exit /b 0
+        '''
+      }
+    }
+
+    stage('Build') {
+      steps {
+        withEnv([
+          "JAVA_HOME=${env.JDK_HOME}",
+          "M2_HOME=${env.MVN_HOME}",
+          "PATH+JAVA=${env.JDK_HOME}\\bin",
+          "PATH+MAVEN=${env.MVN_HOME}\\bin",
+          "MAVEN_OPTS=-Xmx1024m -Dfile.encoding=UTF-8"
+        ]) {
+          script {
+            // Visibility & sanity
+            bat 'echo === Build: env check ==='
+            bat '"%JAVA_HOME%\\bin\\java.exe" -version'
+            bat '"%M2_HOME%\\bin\\mvn.cmd" -v'
+            bat 'echo Current dir: %CD% & if exist pom.xml (echo Found pom.xml) else (echo pom.xml NOT FOUND) & dir /b'
+
+            // Decide Maven command (wrapper-first) in Groovy; avoid complex IF in CMD
+            def mvnCmd = fileExists('mvnw.cmd') ? 'mvnw.cmd' : '%M2_HOME%\\bin\\mvn.cmd'
+            if (mvnCmd.contains('%M2_HOME%')) {
+              mvnCmd = "\"%M2_HOME%\\bin\\mvn.cmd\""
+            }
+
+            // Ensure target is gone
+            bat 'if exist target rmdir /s /q target'
+
+            // Build (CALL is essential for *.cmd)
+            bat "call ${mvnCmd} -B -e -U clean package"
+
+            // Verify artifact
+            bat 'if not exist target (echo ERROR: target directory not created & exit /b 1)'
+            bat 'dir target'
+            bat 'if not exist target\\*.jar (echo ERROR: No jar produced under target\\*.jar & exit /b 1)'
+          }
+        }
+      }
+    }
+
+    stage('Run Eureka Server') {
+      steps {
+        withEnv([
+          "JAVA_HOME=${env.JDK_HOME}",
+          "PATH+JAVA=${env.JDK_HOME}\\bin"
+        ]) {
+          bat '''
+            @echo on
+
+            echo === Prepare run folder and copy jar ===
+            for %%f in (target\\*.jar) do set "SRC_JAR=%%~ff"
+            if not defined SRC_JAR (
+              echo ERROR: No jar found under target\\*.jar
+              exit /b 1
+            )
+            if exist run rmdir /s /q run
+            mkdir run
+            copy /Y "%SRC_JAR%" run\\EurekaServer.jar
+
+            rem === Keep detached java alive after build ===
+            set "BUILD_ID=dontKillMe"
+            set "JENKINS_NODE_COOKIE=do_not_kill"
+
+            echo === Start Eureka DETACHED on port %EUREKA_PORT% from run\\EurekaServer.jar ===
+            start "" /b "%JAVA_HOME%\\bin\\java.exe" -jar "%CD%\\run\\EurekaServer.jar" --server.port=%EUREKA_PORT%
+
+            echo === Wait up to 60s for HTTP to respond on http://127.0.0.1:%EUREKA_PORT% ===
+            set COUNT=0
+            :wait_http
+            set /a COUNT+=1
+            ping -n 2 127.0.0.1 >nul
+            curl -s -o NUL http://127.0.0.1:%EUREKA_PORT%/
+            if not errorlevel 1 goto up_http
+            if %COUNT% GEQ 60 goto fail_http
+            goto wait_http
+
+            :up_http
+            echo SUCCESS: Eureka responded on http://localhost:%EUREKA_PORT%
+            exit /b 0
+
+            :fail_http
+            echo ERROR: HTTP did not respond within 60 seconds. Eureka likely failed to start or is bound differently.
+            echo Hint: Run once in foreground on this machine to see the exact error:
+            echo   "%JAVA_HOME%\\bin\\java.exe" -jar "%CD%\\run\\EurekaServer.jar" --server.port=%EUREKA_PORT%
+            exit /b 1
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      echo "Pipeline finished (port ${env.EUREKA_PORT}). Eureka keeps running in the background (from run\\EurekaServer.jar)."
+    }
+  }
+}
