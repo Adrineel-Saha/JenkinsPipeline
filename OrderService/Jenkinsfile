@@ -1,0 +1,169 @@
+pipeline {
+  agent any
+
+  environment {
+    // Tool names must exist in "Manage Jenkins > Tools"
+    JDK_HOME = tool name: 'JDK17', type: 'jdk'
+    MVN_HOME = tool name: 'Maven3', type: 'maven'
+    // Intentionally NOT setting any Config Server URI, profiles, or port here.
+  }
+
+  stages {
+
+    stage('Clone Repository') {
+      steps {
+        git url: 'https://github.com/Adrineel-Saha/OrderService.git', branch: 'main'
+      }
+    }
+
+    // We do NOT read or set server.port in this pipeline.
+    // The application will obtain it from your own config (e.g., Config Server/Eureka) or default to 8080.
+
+    stage('Kill Old Instance') {
+      steps {
+        // Since we don't know the port, kill any previously started detached JVM that runs this app JAR
+        // We search for a java process whose command line contains "OrderService.jar" and kill it if present.
+        bat '''
+          @echo on
+          echo === Kill (pre-build): looking for java process running OrderService.jar ===
+          set "FOUND="
+          for /f "skip=1 tokens=1" %%p in ('wmic process where "CommandLine like '%%OrderService.jar%%' and Name='java.exe'" get ProcessId ^| findstr /r "^[0-9][0-9]*$"') do (
+            set FOUND=1
+            echo Found PID: %%p - attempting kill
+            taskkill /F /PID %%p >nul 2>&1
+          )
+          if not defined FOUND (
+            echo No running OrderService.jar process found (nothing to kill)
+          )
+          exit /b 0
+        '''
+      }
+    }
+
+    stage('Compile') {
+      steps {
+        withEnv([
+          "JAVA_HOME=${env.JDK_HOME}",
+          "M2_HOME=${env.MVN_HOME}",
+          "PATH+JAVA=${env.JDK_HOME}\\bin",
+          "PATH+MAVEN=${env.MVN_HOME}\\bin",
+          "MAVEN_OPTS=-Xmx1024m -Dfile.encoding=UTF-8"
+        ]) {
+          script {
+            bat 'echo === Compile: -DskipTests compile ==='
+            bat '"%JAVA_HOME%\\bin\\java.exe" -version'
+            bat '"%M2_HOME%\\bin\\mvn.cmd" -v'
+
+            def mvnCmd = fileExists('mvnw.cmd') ? 'mvnw.cmd' : '"%M2_HOME%\\bin\\mvn.cmd"'
+            bat "call ${mvnCmd} -B -e -DskipTests compile"
+            bat 'if errorlevel 1 exit /b 1'
+          }
+        }
+      }
+    }
+
+    stage('Unit Tests') {
+      steps {
+        withEnv([
+          "JAVA_HOME=${env.JDK_HOME}",
+          "M2_HOME=${env.MVN_HOME}",
+          "PATH+JAVA=${env.JDK_HOME}\\bin",
+          "PATH+MAVEN=${env.MVN_HOME}\\bin"
+        ]) {
+          script {
+            bat 'echo === Unit Tests: mvn test ==='
+            def mvnCmd = fileExists('mvnw.cmd') ? 'mvnw.cmd' : '"%M2_HOME%\\bin\\mvn.cmd"'
+            bat "call ${mvnCmd} -B -e test"
+            bat 'if errorlevel 1 exit /b 1'
+          }
+        }
+      }
+    }
+
+    stage('Build (package)') {
+      steps {
+        withEnv([
+          "JAVA_HOME=${env.JDK_HOME}",
+          "M2_HOME=${env.MVN_HOME}",
+          "PATH+JAVA=${env.JDK_HOME}\\bin",
+          "PATH+MAVEN=${env.MVN_HOME}\\bin"
+        ]) {
+          script {
+            bat 'echo === Package: mvn clean package -DskipTests ==='
+            // Clean old target safely
+            bat 'if exist target rmdir /s /q target'
+            def mvnCmd = fileExists('mvnw.cmd') ? 'mvnw.cmd' : '"%M2_HOME%\\bin\\mvn.cmd"'
+            bat "call ${mvnCmd} -B -e clean package -DskipTests"
+            bat 'if errorlevel 1 exit /b 1'
+
+            // Verify artifact immediately
+            bat 'if not exist target (echo ERROR: target not created & exit /b 1)'
+            bat 'dir target'
+            bat 'if not exist target\\*.jar (echo ERROR: No jar in target & exit /b 1)'
+          }
+        }
+      }
+    }
+
+    stage('Run OrderService') {
+      steps {
+        withEnv([
+          "JAVA_HOME=${env.JDK_HOME}",
+          "PATH+JAVA=${env.JDK_HOME}\\bin"
+        ]) {
+          bat '''
+            @echo on
+            setlocal enabledelayedexpansion
+
+            echo === Resolve JAR from target ===
+            set "SRC_JAR="
+            for %%f in (target\\*.jar) do (
+              set "SRC_JAR=%%~ff"
+              goto :haveJar
+            )
+            echo ERROR: No jar found under target\\*.jar
+            exit /b 1
+            :haveJar
+            echo SRC_JAR=%SRC_JAR%
+
+            rem --- Prepare run dir and copy the jar (avoid locking target) ---
+            set "RUN_DIR=%CD%\\run"
+            if exist "%RUN_DIR%" rmdir /s /q "%RUN_DIR%"
+            mkdir "%RUN_DIR%"
+            echo Copying to "%RUN_DIR%\\OrderService.jar"
+            copy /Y "%SRC_JAR%" "%RUN_DIR%\\OrderService.jar"
+            if errorlevel 1 (
+              echo ERROR: Copy failed
+              dir "%RUN_DIR%"
+              exit /b 1
+            )
+
+            rem --- Keep detached java alive after the pipeline ends ---
+            set "BUILD_ID=dontKillMe"
+            set "JENKINS_NODE_COOKIE=do_not_kill"
+
+            rem --- IMPORTANT ---
+            rem No URI/profiles/port exported here. The app reads them from its own config.
+            rem If your config (via Config Server/Eureka) sets server.port, the app will bind to that.
+            rem Otherwise Spring Boot default (8080) applies.
+
+            echo === Start OrderService DETACHED (no explicit --server.port) ===
+            start "" /b "%JAVA_HOME%\\bin\\java.exe" -jar "%RUN_DIR%\\OrderService.jar"
+
+            echo === No explicit readiness probe (port is unknown to pipeline) ===
+            echo If you need readiness checks, expose a known health endpoint and port via your config.
+            exit /b 0
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      echo "Pipeline finished. OrderService is running in the background using its own configured port."
+      // Optional: publish unit test reports in Jenkins UI
+      // junit 'target/surefire-reports/*.xml'
+    }
+  }
+}
