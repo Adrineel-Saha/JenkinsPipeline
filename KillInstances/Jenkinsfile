@@ -1,0 +1,186 @@
+// Helper: strict extractor (uses the SAME regex everywhere)
+@NonCPS
+def extractPortsStrict(String text) {
+  // EXACT SAME REGEX used for Eureka, ConfigServer and Configurations repo:
+  // ^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$
+  def ports = []
+  def re = ~/(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/
+  def m = re.matcher(text)
+  while (m.find()) ports << m.group(1)
+  return ports
+}
+
+pipeline {
+  agent any
+
+  stages {
+
+    stage('Prep: Clean workspace') {
+      steps { deleteDir() }
+    }
+
+    stage('Clone Repositories') {
+      steps {
+        dir('eureka') { git url: 'https://github.com/Adrineel-Saha/EurekaServer.git', branch: 'main' }
+        dir('config') { git url: 'https://github.com/Adrineel-Saha/ConfigServer.git', branch: 'main' }
+        // Intentionally NOT cloning UserService repo
+      }
+    }
+
+    // --- Read port from Eureka application.yml (STRICT regex) ---
+    stage('Read Port from application.yml (Eureka)') {
+      steps {
+        script {
+          def ymlPath = 'eureka/src/main/resources/application.yml'
+          if (!fileExists(ymlPath)) error "Eureka: application.yml not found at ${ymlPath}"
+          def yml = readFile ymlPath
+
+          def ports = extractPortsStrict(yml)
+          if (ports) {
+            env.EUREKA_PORT = ports[0]
+            echo "Eureka server.port: ${env.EUREKA_PORT}"
+          } else {
+            error "Eureka: server.port not found under exact structure:\nserver:\n  port: <number>"
+          }
+        }
+      }
+    }
+
+    // --- Read port and Config repo URI from ConfigServer application.yml (STRICT regex) ---
+    stage('Read Port & Config Repo URI (ConfigServer)') {
+      steps {
+        script {
+          def ymlPath = 'config/src/main/resources/application.yml'
+          if (!fileExists(ymlPath)) error "ConfigServer: application.yml not found at ${ymlPath}"
+          def yml = readFile ymlPath
+
+          // Same strict regex
+          def ports = extractPortsStrict(yml)
+          if (ports) {
+            env.CONFIG_PORT = ports[0]
+            echo "ConfigServer server.port: ${env.CONFIG_PORT}"
+          } else {
+            error "ConfigServer: server.port not found under exact structure:\nserver:\n  port: <number>"
+          }
+
+          // Read spring.cloud.config.server.git.uri (strict first, then relaxed)
+          def uriStrict = (yml =~ /(?ms)^spring:\s*(?:\r?\n|\r)\s*cloud:\s*(?:\r?\n|\r)\s*config:\s*(?:\r?\n|\r)\s*server:\s*(?:\r?\n|\r)\s*git:\s*(?:\r?\n|\r)\s*uri:\s*([^\s#'"]+|['"][^'"]+['"])/)
+          def configRepoUri = null
+          if (uriStrict.find()) {
+            configRepoUri = uriStrict.group(1)
+          } else {
+            def uriLoose = (yml =~ /(?m)^\s*uri:\s*([^\s#'"]+|['"][^'"]+['"])\s*$/)
+            if (uriLoose.find()) configRepoUri = uriLoose.group(1)
+          }
+          if (!configRepoUri) error "ConfigServer: spring.cloud.config.server.git.uri not found in application.yml"
+
+          // Strip wrapping quotes
+          configRepoUri = configRepoUri.replaceAll(/^['"]|['"]$/, '')
+          env.CONFIG_REPO_URI = configRepoUri
+          echo "Configurations repo: ${env.CONFIG_REPO_URI}"
+        }
+      }
+    }
+
+    // --- Clone Configurations repo and scan ALL YAML with the SAME strict regex ---
+    stage('Clone Configurations Repo & Scan Ports') {
+      steps {
+        script {
+          // Clone configurations repo
+          dir('configs') {
+            git url: env.CONFIG_REPO_URI, branch: 'main'
+          }
+
+          // Build a list of YAML files using Windows commands (sandbox-safe)
+          bat '''
+            @echo on
+            del /f /q yml_list.txt >nul 2>&1
+            for /r configs %%F in (*.yml)  do @echo %%F>> yml_list.txt
+            for /r configs %%F in (*.yaml) do @echo %%F>> yml_list.txt
+          '''
+
+          def listPath = 'yml_list.txt'
+          def yamlFiles = fileExists(listPath) ? readFile(listPath).readLines() : []
+          yamlFiles = yamlFiles.collect { it?.trim() }.findAll { it }
+
+          echo yamlFiles ? "Found ${yamlFiles.size()} YAML files to scan." : "No YAML files found in configurations repo."
+
+          // Make absolute -> workspace-relative for readFile
+          def ws = pwd().replace('\\','/')
+          def discovered = new LinkedHashSet<String>()
+
+          yamlFiles.each { abs ->
+            def norm = abs.replace('\\','/')
+            def rel  = norm.startsWith(ws + '/') ? norm.substring(ws.length() + 1) : norm
+            if (fileExists(rel)) {
+              def content = readFile(rel)
+              extractPortsStrict(content).each { p ->
+                if (p?.trim()) discovered << p.trim()
+              }
+            } else {
+              echo "Skipping (not under workspace): ${abs}"
+            }
+          }
+
+          echo "Discovered ports from configurations repo (strict server:port): " +
+               (discovered ? discovered.join(', ') : 'none')
+
+          // Final port list = Eureka + ConfigServer + all discovered
+          def allPorts = new LinkedHashSet<String>()
+          if (env.EUREKA_PORT?.trim()) allPorts << env.EUREKA_PORT.trim()
+          if (env.CONFIG_PORT?.trim()) allPorts << env.CONFIG_PORT.trim()
+          discovered.each { allPorts << it }
+
+          // Keep everything in-memory via env variables (NO ports.txt)
+          env.DISCOVERED_PORTS = discovered ? discovered.join(' ') : ''
+          env.PORTS_TO_KILL = allPorts ? allPorts.join(' ') : ''
+          echo "Final port list to kill (in-memory): " + (allPorts ? allPorts.join(', ') : 'none')
+        }
+      }
+    }
+
+    // --- Kill any process listening on each discovered port (NO ports.txt) ---
+    stage('Kill ALL discovered instances') {
+      when { expression { return (env.PORTS_TO_KILL?.trim()) } }
+      steps {
+        bat '''
+          @echo on
+          setlocal enabledelayedexpansion
+
+          if "%PORTS_TO_KILL%"=="" (
+            echo No ports to kill. Skipping.
+            exit /b 0
+          )
+
+          echo Ports to kill: %PORTS_TO_KILL%
+
+          for %%P in (%PORTS_TO_KILL%) do (
+            echo === Kill: looking for process on :%%P ===
+            set "FOUND="
+            rem Find PID(s) bound to the port; use the same matching style as earlier (space after port)
+            for /f "tokens=5" %%p in ('netstat -ano ^| findstr /r /c:":%%P[ ]"') do (
+              set FOUND=1
+              echo Found PID: %%p on :%%P - attempting kill
+              taskkill /F /PID %%p >nul 2>&1
+            )
+            if not defined FOUND echo No process found on :%%P (nothing to kill)
+          )
+
+          endlocal
+          exit /b 0
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      script {
+        // Pretty-print discovered ports from configurations repo
+        def cfgPortsRaw = (env.DISCOVERED_PORTS ?: '').trim()
+        def cfgSummary = cfgPortsRaw ? (cfgPortsRaw.split(/\s+/) as List<String>).join(', ') : 'n/a'
+        echo "Done. Ports => Eureka=${env.EUREKA_PORT ?: 'n/a'}, ConfigServer=${env.CONFIG_PORT ?: 'n/a'}, From Configurations repo=[${cfgSummary}]."
+      }
+    }
+  }
+}
