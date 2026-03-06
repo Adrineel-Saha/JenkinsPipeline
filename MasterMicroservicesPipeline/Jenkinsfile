@@ -1,0 +1,47 @@
+pipeline {
+    agent any
+
+    stages {
+
+        stage('Run EurekaServer-Pipeline') {
+            steps {
+                echo "Starting EurekaServer-Pipeline..."
+                build job: 'EurekaServer-Pipeline', wait: true, propagate: true
+            }
+        }
+
+        stage('Run ConfigServer-Pipeline') {
+            steps {
+                echo "Starting ConfigServer-Pipeline..."
+                build job: 'ConfigServer-Pipeline', wait: true, propagate: true
+            }
+        }
+
+        stage('Run UserService-Pipeline') {
+            steps {
+                echo "Starting UserService-Pipeline..."
+                build job: 'UserService-Pipeline', wait: true, propagate: true
+            }
+        }
+
+        stage('Run ProductService-Pipeline') {
+            steps {
+                echo "Starting ProductService-Pipeline..."
+                build job: 'ProductService-Pipeline', wait: true, propagate: true
+            }
+        }
+
+        stage('Run OrderService-Pipeline') {
+            steps {
+                echo "Starting OrderService-Pipeline..."
+                build job: 'OrderService-Pipeline', wait: true, propagate: true
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Master pipeline completed."
+        }
+    }
+}
