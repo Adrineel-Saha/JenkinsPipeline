@@ -1,7 +1,11 @@
-// Helper: strict extractor (uses the SAME regex everywhere)
+// Jenkinsfile — No plugins, one checkbox (boolean) per microservice
+// Windows agents assumed (uses bat/netstat/taskkill). See Linux note at the end.
+
+// ------------------- Helpers -------------------
+
 @NonCPS
 def extractPortsStrict(String text) {
-  // EXACT SAME REGEX used for Eureka, ConfigServer and Configurations repo:
+  // EXACT SAME REGEX used across Eureka, ConfigServer and Configurations repo
   // ^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$
   def ports = []
   def re = ~/(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/
@@ -10,8 +14,51 @@ def extractPortsStrict(String text) {
   return ports
 }
 
+@NonCPS
+def extractAppNameStrict(String text) {
+  // Strict structure:
+  // spring:
+  //   application:
+  //     name: <value>
+  def m = (text =~ /(?ms)^spring:\s*(?:\r?\n|\r)\s*application:\s*(?:\r?\n|\r)\s*name:\s*([^\s#'"]+|['"][^'"]+['"])\s*$/)
+  if (m.find()) {
+    def raw = m.group(1)
+    return raw.replaceAll(/^['"]|['"]$/, '').trim()
+  }
+  return null
+}
+
+@NonCPS
+def deriveServiceKeyFromPath(String relPath) {
+  // Derive a reasonable service key from filename as fallback
+  def name = relPath.replace('\\','/').replaceAll('^.+/','')
+  name = name.toLowerCase().replaceAll(/\.(yml|yaml)$/,'')
+  if (name.startsWith('application-')) {
+    name = name - 'application-'
+  }
+  // Trim common env/profile suffixes (best-effort)
+  name = name.replaceAll(/-(dev|test|stage|staging|prod|production|local|default)$/, '')
+  return name
+}
+
+// Turn a service key into a safe boolean parameter name (checkbox)
+@NonCPS
+def toParamName(String serviceKey) {
+  // SVC_<ALNUM_AND_UNDERSCORE>, uppercase
+  return 'SVC_' + serviceKey.replaceAll(/[^A-Za-z0-9]+/, '_').toUpperCase()
+}
+
+// ------------------- Pipeline -------------------
+
 pipeline {
   agent any
+
+  // Optional tiny params so you can run the very first time (no plugin needed).
+  // We'll overwrite these with the discovered per-service checkboxes.
+  parameters {
+    booleanParam(name: 'SVC_EUREKA', defaultValue: false, description: 'Kill Eureka')
+    booleanParam(name: 'SVC_CONFIG', defaultValue: false, description: 'Kill ConfigServer')
+  }
 
   stages {
 
@@ -23,7 +70,6 @@ pipeline {
       steps {
         dir('eureka') { git url: 'https://github.com/Adrineel-Saha/EurekaServer.git', branch: 'main' }
         dir('config') { git url: 'https://github.com/Adrineel-Saha/ConfigServer.git', branch: 'main' }
-        // Intentionally NOT cloning UserService repo
       }
     }
 
@@ -46,7 +92,7 @@ pipeline {
       }
     }
 
-    // --- Read port and Config repo URI from ConfigServer application.yml (STRICT regex) ---
+    // --- Read port & Config repo URI from ConfigServer application.yml (STRICT regex) ---
     stage('Read Port & Config Repo URI (ConfigServer)') {
       steps {
         script {
@@ -54,7 +100,6 @@ pipeline {
           if (!fileExists(ymlPath)) error "ConfigServer: application.yml not found at ${ymlPath}"
           def yml = readFile ymlPath
 
-          // Same strict regex
           def ports = extractPortsStrict(yml)
           if (ports) {
             env.CONFIG_PORT = ports[0]
@@ -63,7 +108,7 @@ pipeline {
             error "ConfigServer: server.port not found under exact structure:\nserver:\n  port: <number>"
           }
 
-          // Read spring.cloud.config.server.git.uri (strict first, then relaxed)
+          // Read spring.cloud.config.server.git.uri (strict then relaxed)
           def uriStrict = (yml =~ /(?ms)^spring:\s*(?:\r?\n|\r)\s*cloud:\s*(?:\r?\n|\r)\s*config:\s*(?:\r?\n|\r)\s*server:\s*(?:\r?\n|\r)\s*git:\s*(?:\r?\n|\r)\s*uri:\s*([^\s#'"]+|['"][^'"]+['"])/)
           def configRepoUri = null
           if (uriStrict.find()) {
@@ -74,16 +119,14 @@ pipeline {
           }
           if (!configRepoUri) error "ConfigServer: spring.cloud.config.server.git.uri not found in application.yml"
 
-          // Strip wrapping quotes
-          configRepoUri = configRepoUri.replaceAll(/^['"]|['"]$/, '')
-          env.CONFIG_REPO_URI = configRepoUri
+          env.CONFIG_REPO_URI = configRepoUri.replaceAll(/^['"]|['"]$/, '')
           echo "Configurations repo: ${env.CONFIG_REPO_URI}"
         }
       }
     }
 
-    // --- Clone Configurations repo and scan ALL YAML with the SAME strict regex ---
-    stage('Clone Configurations Repo & Scan Ports') {
+    // --- Discover services and create boolean checkboxes dynamically (no plugins) ---
+    stage('Discover Services & Create Checkboxes') {
       steps {
         script {
           // Clone configurations repo
@@ -91,7 +134,7 @@ pipeline {
             git url: env.CONFIG_REPO_URI, branch: 'main'
           }
 
-          // Build a list of YAML files using Windows commands (sandbox-safe)
+          // Find YAML files (Windows)
           bat '''
             @echo on
             del /f /q yml_list.txt >nul 2>&1
@@ -105,42 +148,261 @@ pipeline {
 
           echo yamlFiles ? "Found ${yamlFiles.size()} YAML files to scan." : "No YAML files found in configurations repo."
 
-          // Make absolute -> workspace-relative for readFile
           def ws = pwd().replace('\\','/')
-          def discovered = new LinkedHashSet<String>()
+
+          def servicePorts = [:]   // key: serviceKey, value: List<String> ports
+
+          // Build service -> ports
+          yamlFiles.each { abs ->
+            def norm = abs.replace('\\','/')
+            def rel  = norm.startsWith(ws + '/') ? norm.substring(ws.length() + 1) : norm
+            if (fileExists(rel)) {
+              def content = readFile(rel)
+              def ports = extractPortsStrict(content)
+              if (ports && !ports.isEmpty()) {
+                def appName = extractAppNameStrict(content)
+                def key = (appName ? appName : deriveServiceKeyFromPath(rel))?.toLowerCase()?.trim()
+                if (!servicePorts.containsKey(key)) servicePorts[key] = []
+                ports.each { p ->
+                  def v = p?.trim()
+                  if (v && !servicePorts[key].contains(v)) servicePorts[key] << v
+                }
+              }
+            }
+          }
+
+          // Add infra aliases
+          if (env.EUREKA_PORT?.trim()) {
+            ['eureka','eureka-server'].each { a ->
+              if (!servicePorts.containsKey(a)) servicePorts[a] = []
+              if (!servicePorts[a].contains(env.EUREKA_PORT.trim())) servicePorts[a] << env.EUREKA_PORT.trim()
+            }
+          }
+          if (env.CONFIG_PORT?.trim()) {
+            ['config','configserver','config-server'].each { a ->
+              if (!servicePorts.containsKey(a)) servicePorts[a] = []
+              if (!servicePorts[a].contains(env.CONFIG_PORT.trim())) servicePorts[a] << env.CONFIG_PORT.trim()
+            }
+          }
+
+          // Collapse synonyms for clean UI
+          def serviceKeys = []
+          servicePorts.keySet().each { k ->
+            if (!serviceKeys.contains(k)) serviceKeys << k
+          }
+          if (serviceKeys.contains('eureka') || serviceKeys.contains('eureka-server')) {
+            serviceKeys.removeAll { it == 'eureka-server' }
+            if (!serviceKeys.contains('eureka')) serviceKeys << 'eureka'
+          }
+          if (serviceKeys.contains('config') || serviceKeys.contains('configserver') || serviceKeys.contains('config-server')) {
+            serviceKeys.removeAll { it in ['configserver','config-server'] }
+            if (!serviceKeys.contains('config')) serviceKeys << 'config'
+          }
+
+          // Build BooleanParameterDefinition list dynamically
+          def paramDefs = []
+          def mappingLines = []
+
+          serviceKeys.sort().each { svc ->
+            def paramName = toParamName(svc)    // e.g., user-service -> SVC_USER_SERVICE
+            paramDefs << [$class: 'BooleanParameterDefinition',
+                          name: paramName,
+                          defaultValue: false,
+                          description: "Kill service: ${svc}"]
+            mappingLines << "${paramName}=${svc}"
+          }
+
+          // Persist mapping param -> serviceKey to a file so we can read it next stage
+          writeFile file: 'svc_params.txt', text: mappingLines.join('\n')
+
+          // Overwrite job parameters with ONLY these booleans (removes any old ones)
+          properties([ parameters(paramDefs) ])
+
+          // Diagnostics
+          echo "Created ${paramDefs.size()} checkbox parameters:"
+          paramDefs.each { pd -> echo "  - ${pd.name} (${pd.description})" }
+        }
+      }
+    }
+
+    // --- Compute selection based on the boolean checkboxes created above ---
+    stage('Resolve Selection & Compute Ports') {
+      steps {
+        script {
+          if (!fileExists('svc_params.txt')) {
+            echo "svc_params.txt not found (first run after update?). Re-run the job via 'Build with Parameters' to see the checkboxes."
+            env.PORTS_TO_KILL = ''
+            return
+          }
+
+          def ws = pwd().replace('\\','/')
+          def servicePorts = [:]   // Map<String, List<String>>
+
+          def listPath = 'yml_list.txt'
+          def yamlFiles = fileExists(listPath) ? readFile(listPath).readLines() : []
+          yamlFiles = yamlFiles.collect { it?.trim() }.findAll { it }
 
           yamlFiles.each { abs ->
             def norm = abs.replace('\\','/')
             def rel  = norm.startsWith(ws + '/') ? norm.substring(ws.length() + 1) : norm
             if (fileExists(rel)) {
               def content = readFile(rel)
-              extractPortsStrict(content).each { p ->
-                if (p?.trim()) discovered << p.trim()
+              def ports = extractPortsStrict(content)
+              if (ports && !ports.isEmpty()) {
+                def appName = extractAppNameStrict(content)
+                def key = (appName ? appName : deriveServiceKeyFromPath(rel))?.toLowerCase()?.trim()
+                if (!servicePorts.containsKey(key)) servicePorts[key] = []
+                ports.each { p ->
+                  def v = p?.trim()
+                  if (v && !servicePorts[key].contains(v)) servicePorts[key] << v
+                }
               }
-            } else {
-              echo "Skipping (not under workspace): ${abs}"
             }
           }
 
-          echo "Discovered ports from configurations repo (strict server:port): " +
-               (discovered ? discovered.join(', ') : 'none')
+          // Add infra again
+          if (env.EUREKA_PORT?.trim()) {
+            ['eureka','eureka-server'].each { a ->
+              if (!servicePorts.containsKey(a)) servicePorts[a] = []
+              if (!servicePorts[a].contains(env.EUREKA_PORT.trim())) servicePorts[a] << env.EUREKA_PORT.trim()
+            }
+          }
+          if (env.CONFIG_PORT?.trim()) {
+            ['config','configserver','config-server'].each { a ->
+              if (!servicePorts.containsKey(a)) servicePorts[a] = []
+              if (!servicePorts[a].contains(env.CONFIG_PORT.trim())) servicePorts[a] << env.CONFIG_PORT.trim()
+            }
+          }
 
-          // Final port list = Eureka + ConfigServer + all discovered
-          def allPorts = new LinkedHashSet<String>()
-          if (env.EUREKA_PORT?.trim()) allPorts << env.EUREKA_PORT.trim()
-          if (env.CONFIG_PORT?.trim()) allPorts << env.CONFIG_PORT.trim()
-          discovered.each { allPorts << it }
+          // Canonicalize keys
+          def canonical = [:]  // Map<String, List<String>>
+          servicePorts.each { k, list ->
+            def c = (k in ['eureka','eureka-server']) ? 'eureka'
+                    : (k in ['config','configserver','config-server']) ? 'config'
+                    : k
+            if (!canonical.containsKey(c)) canonical[c] = []
+            list.each { p -> if (!canonical[c].contains(p)) canonical[c] << p }
+          }
 
-          // Keep everything in-memory via env variables (NO ports.txt)
-          env.DISCOVERED_PORTS = discovered ? discovered.join(' ') : ''
-          env.PORTS_TO_KILL = allPorts ? allPorts.join(' ') : ''
-          echo "Final port list to kill (in-memory): " + (allPorts ? allPorts.join(', ') : 'none')
+          // Read mapping paramName=serviceKey
+          def mapText = readFile('svc_params.txt')
+          def lines = mapText.readLines().findAll { it?.trim() }
+
+          def selectedPorts = [] as List<String>
+
+          lines.each { line ->
+            def parts = line.split('=', 2)
+            if (parts.size() == 2) {
+              def paramName = parts[0]
+              def svcKey = parts[1]
+              def checked = params.containsKey(paramName) ? params[paramName] : false
+              if (checked) {
+                def canonicalKey = (svcKey in ['eureka','eureka-server']) ? 'eureka'
+                                   : (svcKey in ['config','configserver','config-server']) ? 'config'
+                                   : svcKey
+                if (canonical.containsKey(canonicalKey)) {
+                  canonical[canonicalKey].each { p ->
+                    if (!selectedPorts.contains(p)) selectedPorts << p
+                  }
+                } else {
+                  echo "Warning: No ports found for selected service '${svcKey}'"
+                }
+              }
+            }
+          }
+
+          env.PORTS_TO_KILL = selectedPorts ? selectedPorts.join(' ') : ''
+
+          // For post summary (configs-only)
+          def discoveredFromConfigs = [] as List<String>
+          canonical.each { k, list ->
+            if (!(k in ['eureka','config'])) {
+              list.each { p -> if (!discoveredFromConfigs.contains(p)) discoveredFromConfigs << p }
+            }
+          }
+          env.DISCOVERED_PORTS = discoveredFromConfigs ? discoveredFromConfigs.join(' ') : ''
+
+          // Diagnostics
+          echo "== Selection this run =="
+          if (lines) {
+            lines.each { line ->
+              def parts = line.split('=', 2)
+              if (parts.size() == 2) {
+                def pn = parts[0]; def sk = parts[1]
+                def checked = params.containsKey(pn) ? params[pn] : false
+                echo "  ${pn.padRight(24)} => ${checked ? 'YES' : 'no'} (service=${sk})"
+              }
+            }
+          } else {
+            echo "  (No parameters discovered yet)"
+          }
+          echo "  Final ports to kill: " + (env.PORTS_TO_KILL ? env.PORTS_TO_KILL.replaceAll(' ', ', ') : 'none')
         }
       }
     }
 
-    // --- Kill any process listening on each discovered port (NO ports.txt) ---
-    stage('Kill ALL discovered instances') {
+    // --- Map selected ports to Eureka instances (app + instanceId) without changing any YAML ---
+    stage('Map Ports -> Eureka Instances') {
+      when { expression { return (env.PORTS_TO_KILL?.trim()) } }
+      steps {
+        script {
+          // Fetch registry JSON
+          bat """
+            @echo on
+            curl -s -H "Accept: application/json" http://127.0.0.1:${env.EUREKA_PORT}/eureka/apps -o apps.json
+            exit /b 0
+          """
+
+          def instancesToDelete = []
+          def portsSel = (env.PORTS_TO_KILL ?: '').trim().split(/\s+/).findAll { it }
+
+          if (fileExists('apps.json')) {
+            def text = readFile('apps.json')
+            if (text?.trim()) {
+              def slurper = new groovy.json.JsonSlurper()
+              def root = slurper.parseText(text)
+
+              def apps = root?.applications?.application
+              if (apps instanceof Map) apps = [apps]
+              if (apps == null) apps = []
+
+              apps.each { app ->
+                def appName = (app?.name ?: '').toString().toUpperCase()
+                def insts = app?.instance
+                if (insts instanceof Map) insts = [insts]
+                insts?.each { inst ->
+                  // Try to resolve the port from standard field, else fallback to URLs
+                  def p = null
+                  def pr = inst?.port
+                  if (pr instanceof Map && pr['$'] != null) p = pr['$'].toString()
+                  if (!p && inst?.statusPageUrl) {
+                    def m = (inst.statusPageUrl =~ /:(\d+)\//); if (m.find()) p = m.group(1)
+                  }
+                  if (!p && inst?.homePageUrl) {
+                    def m = (inst.homePageUrl =~ /:(\d+)\//); if (m.find()) p = m.group(1)
+                  }
+                  if (p && portsSel.contains(p)) {
+                    def iid = (inst?.instanceId ?: "${inst?.app}:${inst?.hostName}:${p}").toString()
+                    instancesToDelete << [app: appName, id: iid, port: p]
+                  }
+                }
+              }
+            }
+          }
+
+          // Persist for the next stage
+          def lines = instancesToDelete.collect { it.app + " " + it.id }
+          writeFile file: 'instances_to_delete.txt', text: lines.join('\n')
+
+          echo instancesToDelete
+            ? "Will deregister ${instancesToDelete.size()} instance(s): " + instancesToDelete.collect{ "${it.app}@${it.port}" }.join(', ')
+            : "No matching instances found in Eureka for ports: ${env.PORTS_TO_KILL}"
+        }
+      }
+    }
+
+    // --- Kill any process listening on each selected port (tight filter to LISTENING only) ---
+    stage('Kill Selected Instances') {
       when { expression { return (env.PORTS_TO_KILL?.trim()) } }
       steps {
         bat '''
@@ -155,15 +417,16 @@ pipeline {
           echo Ports to kill: %PORTS_TO_KILL%
 
           for %%P in (%PORTS_TO_KILL%) do (
-            echo === Kill: looking for process on :%%P ===
+            echo === Kill: looking for LISTENING process on :%%P ===
             set "FOUND="
-            rem Find PID(s) bound to the port; use the same matching style as earlier (space after port)
-            for /f "tokens=5" %%p in ('netstat -ano ^| findstr /r /c:":%%P[ ]"') do (
+
+            rem Only match TCP LISTENING sockets to avoid false positives and PID 0
+            for /f "tokens=5" %%p in ('netstat -ano -p tcp ^| findstr /r /c:":%%P[ ].*LISTENING"') do (
               set FOUND=1
               echo Found PID: %%p on :%%P - attempting kill
               taskkill /F /PID %%p >nul 2>&1
             )
-            if not defined FOUND echo No process found on :%%P (nothing to kill)
+            if not defined FOUND echo No LISTENING process found on :%%P (nothing to kill)
           )
 
           endlocal
@@ -171,15 +434,77 @@ pipeline {
         '''
       }
     }
+
+    // --- Deregister killed instances from Eureka (no YAML changes) ---
+    stage('Deregister from Eureka') {
+      when { expression { return fileExists('instances_to_delete.txt') } }
+      steps {
+        bat '''
+          @echo on
+          if not exist instances_to_delete.txt (
+            echo No instances mapped for deregistration.
+            exit /b 0
+          )
+          for /f "usebackq tokens=1,2" %%A in ("instances_to_delete.txt") do (
+            echo Deregistering from Eureka: APP=%%A, INSTANCEID=%%B
+            curl -s -f -X DELETE "http://127.0.0.1:%EUREKA_PORT%/eureka/apps/%%A/%%B" >nul 2>&1
+          )
+          exit /b 0
+        '''
+      }
+    }
+
+    // --- (Optional) Verify removal quickly ---
+    stage('Verify Deregistration (Quick)') {
+      when { expression { return (env.PORTS_TO_KILL?.trim()) } }
+      steps {
+        script {
+          bat """
+            @echo on
+            curl -s -H "Accept: application/json" http://127.0.0.1:${env.EUREKA_PORT}/eureka/apps -o apps_after.json
+            exit /b 0
+          """
+          def after = fileExists('apps_after.json') ? readFile('apps_after.json') : ''
+          if (after) {
+            def slurper = new groovy.json.JsonSlurper()
+            def root = slurper.parseText(after)
+            def apps = root?.applications?.application
+            if (apps instanceof Map) apps = [apps]
+            apps = apps ?: []
+            def present = []
+            def portsSel = (env.PORTS_TO_KILL ?: '').trim().split(/\s+/).findAll { it }
+            apps.each { app ->
+              def insts = app?.instance
+              if (insts instanceof Map) insts = [insts]
+              insts?.each { inst ->
+                def p = null
+                def pr = inst?.port
+                if (pr instanceof Map && pr['$'] != null) p = pr['$'].toString()
+                if (!p && inst?.homePageUrl) {
+                  def m = (inst.homePageUrl =~ /:(\d+)\//); if (m.find()) p = m.group(1)
+                }
+                if (p && portsSel.contains(p)) {
+                  present << "${app?.name}@${p}"
+                }
+              }
+            }
+            echo present ? "Still present in registry (may be cache/eviction delay): ${present.join(', ')}"
+                         : "All selected ports appear removed from Eureka registry."
+          } else {
+            echo "Skipped verification — registry fetch failed or empty."
+          }
+        }
+      }
+    }
   }
 
   post {
     always {
       script {
-        // Pretty-print discovered ports from configurations repo
         def cfgPortsRaw = (env.DISCOVERED_PORTS ?: '').trim()
         def cfgSummary = cfgPortsRaw ? (cfgPortsRaw.split(/\s+/) as List<String>).join(', ') : 'n/a'
         echo "Done. Ports => Eureka=${env.EUREKA_PORT ?: 'n/a'}, ConfigServer=${env.CONFIG_PORT ?: 'n/a'}, From Configurations repo=[${cfgSummary}]."
+        echo "Tip: If this was the first run after changing the pipeline, click 'Build with Parameters' again to see the new checkboxes."
       }
     }
   }
