@@ -37,6 +37,13 @@ pipeline {
                 build job: 'OrderService-Pipeline', wait: true, propagate: true
             }
         }
+		
+		stage('Run ApiGateway-Pipeline') {
+            steps {
+                echo "Starting ApiGateway-Pipeline..."
+                build job: 'ApiGateway-Pipeline', wait: true, propagate: true
+            }
+        }
     }
 
     post {
