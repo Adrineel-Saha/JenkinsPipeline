@@ -40,7 +40,7 @@ pipeline {
       }
     }
 
-    stage('Compile') {
+    stage('Build') {
       steps {
         withEnv([
           "JAVA_HOME=${env.JDK_HOME}",
@@ -50,62 +50,34 @@ pipeline {
           "MAVEN_OPTS=-Xmx1024m -Dfile.encoding=UTF-8"
         ]) {
           script {
-            bat 'echo === Compile: -DskipTests compile ==='
+            // Visibility & sanity
+            bat 'echo === Build: env check ==='
             bat '"%JAVA_HOME%\\bin\\java.exe" -version'
             bat '"%M2_HOME%\\bin\\mvn.cmd" -v'
+            bat 'echo Current dir: %CD% & if exist pom.xml (echo Found pom.xml) else (echo pom.xml NOT FOUND) & dir /b'
 
-            def mvnCmd = fileExists('mvnw.cmd') ? 'mvnw.cmd' : '"%M2_HOME%\\bin\\mvn.cmd"'
-            bat "call ${mvnCmd} -B -e -DskipTests compile"
-            bat 'if errorlevel 1 exit /b 1'
-          }
-        }
-      }
-    }
+            // Decide Maven command (wrapper-first) in Groovy; avoid complex IF in CMD
+            def mvnCmd = fileExists('mvnw.cmd') ? 'mvnw.cmd' : '%M2_HOME%\\bin\\mvn.cmd'
+            if (mvnCmd.contains('%M2_HOME%')) {
+              mvnCmd = "\"%M2_HOME%\\bin\\mvn.cmd\""
+            }
 
-    stage('Unit Tests') {
-      steps {
-        withEnv([
-          "JAVA_HOME=${env.JDK_HOME}",
-          "M2_HOME=${env.MVN_HOME}",
-          "PATH+JAVA=${env.JDK_HOME}\\bin",
-          "PATH+MAVEN=${env.MVN_HOME}\\bin"
-        ]) {
-          script {
-            bat 'echo === Unit Tests: mvn test ==='
-            def mvnCmd = fileExists('mvnw.cmd') ? 'mvnw.cmd' : '"%M2_HOME%\\bin\\mvn.cmd"'
-            bat "call ${mvnCmd} -B -e test"
-            bat 'if errorlevel 1 exit /b 1'
-          }
-        }
-      }
-    }
-
-    stage('Build (package)') {
-      steps {
-        withEnv([
-          "JAVA_HOME=${env.JDK_HOME}",
-          "M2_HOME=${env.MVN_HOME}",
-          "PATH+JAVA=${env.JDK_HOME}\\bin",
-          "PATH+MAVEN=${env.MVN_HOME}\\bin"
-        ]) {
-          script {
-            bat 'echo === Package: mvn clean package -DskipTests ==='
-            // Clean old target safely
+            // Ensure target is gone
             bat 'if exist target rmdir /s /q target'
-            def mvnCmd = fileExists('mvnw.cmd') ? 'mvnw.cmd' : '"%M2_HOME%\\bin\\mvn.cmd"'
-            bat "call ${mvnCmd} -B -e clean package -DskipTests"
-            bat 'if errorlevel 1 exit /b 1'
 
-            // Verify artifact immediately
-            bat 'if not exist target (echo ERROR: target not created & exit /b 1)'
+            // Build (CALL is essential for *.cmd)
+            bat "call ${mvnCmd} -B -e -U clean package"
+
+            // Verify artifact
+            bat 'if not exist target (echo ERROR: target directory not created & exit /b 1)'
             bat 'dir target'
-            bat 'if not exist target\\*.jar (echo ERROR: No jar in target & exit /b 1)'
+            bat 'if not exist target\\*.jar (echo ERROR: No jar produced under target\\*.jar & exit /b 1)'
           }
         }
       }
     }
 
-    stage('Run ApiGateway') {
+    stage('Run Api Gateway') {
       steps {
         withEnv([
           "JAVA_HOME=${env.JDK_HOME}",
