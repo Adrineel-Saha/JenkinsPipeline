@@ -27,7 +27,10 @@ pipeline {
       steps {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
-          def m = (yml =~ /(?m)^server:\\s*(?:\\r?\\n|\\r)\\s*port:\\s*(\\d+)\\s*$/)
+          
+          // ✅ ORIGINAL, APPROVED REGEX — DO NOT CHANGE
+          def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
+
           if (!m.find()) {
             error "server.port not found in Eureka application.yml"
           }
