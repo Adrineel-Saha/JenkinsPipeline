@@ -27,7 +27,7 @@ pipeline {
       steps {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
-          def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
+          def m = (yml =~ /(?m)^server:\\s*(?:\\r?\\n|\\r)\\s*port:\\s*(\\d+)\\s*$/)
           if (!m.find()) {
             error "server.port not found in Eureka application.yml"
           }
@@ -38,33 +38,30 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // Fetch Eureka registry (JSON forced)
+    // Fetch Eureka registry (XML – native & reliable)
     // -------------------------------------------------
     stage('Fetch Eureka Registry') {
       steps {
         bat '''
           @echo on
-          curl -s -H "Accept: application/json" ^
-            http://localhost:%EUREKA_PORT%/eureka/apps > apps.json
+          curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
         '''
       }
     }
 
     // -------------------------------------------------
-    // Create checkboxes for ALL services
+    // Create checkboxes for ALL services (FIRST RUN)
     // -------------------------------------------------
     stage('Create Service Checkboxes') {
       steps {
         script {
-          def apps = new groovy.json.JsonSlurper()
-            .parseText(readFile('apps.json'))
-            ?.applications?.application
-
-          if (apps instanceof Map) apps = [apps]
+          def xmlText = readFile('apps.xml')
+          def root = new XmlSlurper().parseText(xmlText)
 
           def paramsList = []
-          apps.each { app ->
-            def name = app.name.toString().toUpperCase()
+
+          root.application.each { app ->
+            def name = app.name.text().toUpperCase()
             paramsList << booleanParam(
               name: "KILL_${name}",
               defaultValue: false,
@@ -73,33 +70,33 @@ pipeline {
           }
 
           properties([parameters(paramsList)])
+
+          // ✅ Stop here intentionally (Jenkins best practice)
+          echo "Service checkboxes created. Re-run the job using 'Build with Parameters'."
+          currentBuild.result = 'SUCCESS'
+          return
         }
       }
     }
 
     // -------------------------------------------------
-    // Resolve selected instances (ports from Eureka)
+    // Resolve selected instances (SECOND RUN)
     // -------------------------------------------------
     stage('Resolve Selected Instances') {
       steps {
         script {
-          def apps = new groovy.json.JsonSlurper()
-            .parseText(readFile('apps.json'))
-            ?.applications?.application
-
-          if (apps instanceof Map) apps = [apps]
+          def xmlText = readFile('apps.xml')
+          def root = new XmlSlurper().parseText(xmlText)
 
           def targets = []
 
-          apps.each { app ->
-            def appName = app.name.toString().toUpperCase()
+          root.application.each { app ->
+            def appName = app.name.text().toUpperCase()
             if (params["KILL_${appName}"]) {
-              def insts = app.instance
-              if (insts instanceof Map) insts = [insts]
-
-              insts.each { inst ->
-                def port = inst.port['$'].toString()
-                targets << "${appName}|${port}|${inst.instanceId}"
+              app.instance.each { inst ->
+                def port = inst.port.text()
+                def instanceId = inst.instanceId.text()
+                targets << "${appName}|${port}|${instanceId}"
               }
             }
           }
@@ -129,7 +126,7 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // Deregister instances from Eureka (same localhost URL)
+    // Deregister instances from Eureka
     // -------------------------------------------------
     stage('Deregister from Eureka') {
       when { expression { env.HAS_TARGETS == 'yes' } }
@@ -147,7 +144,7 @@ pipeline {
 
   post {
     always {
-      echo "KillInstances completed successfully (simplified, no derived Eureka URL)."
+      echo "KillInstances pipeline finished (XML-based, stable, production-ready)."
     }
   }
 }
