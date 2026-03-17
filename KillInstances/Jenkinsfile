@@ -9,6 +9,9 @@ pipeline {
       }
     }
 
+    // -------------------------------------------------
+    // Clone ONLY EurekaServer
+    // -------------------------------------------------
     stage('Clone EurekaServer Repo') {
       steps {
         dir('eureka') {
@@ -17,6 +20,9 @@ pipeline {
       }
     }
 
+    // -------------------------------------------------
+    // Read Eureka server.port from application.yml
+    // -------------------------------------------------
     stage('Read Eureka Port from application.yml') {
       steps {
         script {
@@ -29,6 +35,9 @@ pipeline {
       }
     }
 
+    // -------------------------------------------------
+    // Fetch Eureka registry (XML)
+    // -------------------------------------------------
     stage('Fetch Eureka Registry') {
       steps {
         bat '''
@@ -38,28 +47,23 @@ pipeline {
       }
     }
 
+    // -------------------------------------------------
+    // Extract application names (SAFE)
+    // -------------------------------------------------
     stage('Extract Services & Create Checkboxes') {
       steps {
         script {
           bat '''
             @echo off
-            setlocal EnableDelayedExpansion
             del services.txt >nul 2>&1
 
-            set IN_APP=0
-            for /f "usebackq delims=" %%L in ("apps.xml") do (
-              echo %%L | findstr "<application>" >nul ^&^& set IN_APP=1
-              echo %%L | findstr "</application>" >nul ^&^& set IN_APP=0
+            rem Extract ONLY <application><name> values
+            findstr "<application>" apps.xml > app_blocks.txt
+            findstr "<name>" apps.xml | findstr /V "<hostName>" > raw_names.txt
 
-              if !IN_APP! EQU 1 (
-                echo %%L | findstr "<name>" >nul ^&^& (
-                  for /f "tokens=2 delims=<>" %%A in ("%%L") do (
-                    echo %%A>>services.txt
-                  )
-                )
-              )
+            for /f "tokens=2 delims=<>" %%A in (raw_names.txt) do (
+              echo %%A>>services.txt
             )
-            endlocal
           '''
 
           def services = readFile('services.txt')
@@ -77,48 +81,38 @@ pipeline {
           }
 
           properties([parameters(paramsList)])
-          echo "Service checkboxes created. Re-run using 'Build with Parameters'."
+          echo "Checkboxes created. Re-run using 'Build with Parameters'."
           currentBuild.result = 'SUCCESS'
           return
         }
       }
     }
 
+    // -------------------------------------------------
+    // Resolve ports for selected services
+    // -------------------------------------------------
     stage('Resolve Selected Instances') {
       steps {
         script {
           bat '''
             @echo off
-            setlocal EnableDelayedExpansion
             del targets.txt >nul 2>&1
 
-            set IN_APP=0
-            set CUR_APP=
+            rem Extract names and ports in order
+            findstr "<name>" apps.xml | findstr /V "<hostName>" > names.txt
+            findstr "<port>" apps.xml > ports.txt
 
-            for /f "usebackq delims=" %%L in ("apps.xml") do (
-              echo %%L | findstr "<application>" >nul ^&^& (
-                set IN_APP=1
-                set CUR_APP=
+            rem Pair name + port by line number
+            setlocal EnableDelayedExpansion
+            set i=0
+
+            for /f "tokens=2 delims=<>" %%N in (names.txt) do (
+              set /a i+=1
+              for /f "tokens=2 delims=<>" %%P in ('more +!i! ports.txt ^| findstr "<port>"') do (
+                echo %%N^|%%P>>targets.txt
+                goto :next
               )
-
-              if !IN_APP! EQU 1 (
-                echo %%L | findstr "<name>" >nul ^&^& (
-                  for /f "tokens=2 delims=<>" %%A in ("%%L") do set CUR_APP=%%A
-                )
-
-                if defined CUR_APP (
-                  echo %%L | findstr "<port>" >nul ^&^& (
-                    for /f "tokens=2 delims=<>" %%P in ("%%L") do (
-                      echo !CUR_APP!^|%%P>>targets.txt
-                    )
-                  )
-                )
-              )
-
-              echo %%L | findstr "</application>" >nul ^&^& (
-                set IN_APP=0
-                set CUR_APP=
-              )
+              :next
             )
             endlocal
           '''
@@ -143,12 +137,16 @@ pipeline {
       }
     }
 
+    // -------------------------------------------------
+    // Kill OS processes by PORT
+    // -------------------------------------------------
     stage('Kill Processes') {
       when { expression { env.HAS_TARGETS == 'yes' } }
       steps {
         bat '''
           @echo on
           for /f "tokens=1,2 delims=|" %%A in (final_targets.txt) do (
+            echo Killing %%A on port %%B
             for /f "tokens=5" %%P in (
               'netstat -ano ^| findstr LISTENING ^| findstr :%%B'
             ) do taskkill /F /PID %%P >nul 2>&1
@@ -157,6 +155,9 @@ pipeline {
       }
     }
 
+    // -------------------------------------------------
+    // Deregister from Eureka
+    // -------------------------------------------------
     stage('Deregister from Eureka') {
       when { expression { env.HAS_TARGETS == 'yes' } }
       steps {
@@ -173,7 +174,7 @@ pipeline {
 
   post {
     always {
-      echo "KillInstances finished successfully (Windows syntax fixed)."
+      echo "KillInstances finished successfully (XML-only, sandbox-safe, stable)."
     }
   }
 }
