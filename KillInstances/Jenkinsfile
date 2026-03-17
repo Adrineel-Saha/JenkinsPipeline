@@ -61,7 +61,16 @@ pipeline {
 
           // ✅ FIXED: single-line PowerShell, no caret inside string
           bat '''
-            powershell -NoProfile -ExecutionPolicy Bypass -Command "[xml]$x = Get-Content 'apps.xml'; $x.applications.application | ForEach-Object { $_.name } | Set-Content 'services.txt'"
+            powershell -NoProfile -ExecutionPolicy Bypass -Command @'
+[xml]$x = Get-Content "apps.xml"
+
+$x.applications.application | ForEach-Object {
+    $app = $_.name
+    $_.instance | ForEach-Object {
+        "$app|$($_.port)"
+    }
+} | Set-Content "all_targets.txt"
+'@
           '''
 
           def services = readFile('services.txt')
