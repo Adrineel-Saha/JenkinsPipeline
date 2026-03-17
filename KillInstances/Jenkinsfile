@@ -22,15 +22,20 @@ pipeline {
 
     // -------------------------------------------------
     // Read Eureka server.port from application.yml
+    // (✅ ORIGINAL REGEX RESTORED)
     // -------------------------------------------------
     stage('Read Eureka Port from application.yml') {
       steps {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
-          def m = (yml =~ /(?m)^server:\\s*(?:\\r?\\n|\\r)\\s*port:\\s*(\\d+)\\s*$/)
+
+          // ✅ Original, approved regex
+          def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
+
           if (!m.find()) {
             error "server.port not found in Eureka application.yml"
           }
+
           env.EUREKA_PORT = m.group(1)
           echo "Eureka port from repo: ${env.EUREKA_PORT}"
         }
@@ -38,7 +43,7 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // Fetch Eureka registry (XML – native & reliable)
+    // Fetch Eureka registry (XML – native format)
     // -------------------------------------------------
     stage('Fetch Eureka Registry') {
       steps {
@@ -71,7 +76,6 @@ pipeline {
 
           properties([parameters(paramsList)])
 
-          // ✅ Stop here intentionally (Jenkins best practice)
           echo "Service checkboxes created. Re-run the job using 'Build with Parameters'."
           currentBuild.result = 'SUCCESS'
           return
@@ -144,7 +148,7 @@ pipeline {
 
   post {
     always {
-      echo "KillInstances pipeline finished (XML-based, stable, production-ready)."
+      echo "KillInstances pipeline finished (XML-only, original regex restored)."
     }
   }
 }
