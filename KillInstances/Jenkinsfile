@@ -59,15 +59,15 @@ pipeline {
       steps {
         script {
 
-          // ✅ Write PowerShell script to extract service names
+          // ✅ PowerShell script: extract service names
           writeFile file: 'extract-services.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
+
 $x.applications.application | ForEach-Object {
     $_.name
 } | Set-Content "services.txt"
 '''
 
-          // ✅ Execute PowerShell safely
           bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
 
           def services = readFile('services.txt')
@@ -125,82 +125,10 @@ $x.applications.application | ForEach-Object {
       steps {
         script {
 
-          // ✅ Write PowerShell script to resolve ports
+          // ✅ FIXED PowerShell script: extract PORT TEXT, not XML element
           writeFile file: 'resolve-targets.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 
 $x.applications.application | ForEach-Object {
     $app = $_.name
     $_.instance | ForEach-Object {
-        "$app|$($_.port)"
-    }
-} | Set-Content "all_targets.txt"
-'''
-
-          // ✅ Execute PowerShell safely
-          bat 'powershell -NoProfile -ExecutionPolicy Bypass -File resolve-targets.ps1'
-
-          def selected = []
-
-          // Eureka explicitly
-          if (params.KILL_EUREKA) {
-            selected << "EUREKA|${env.EUREKA_PORT}"
-          }
-
-          // Other services
-          readFile('all_targets.txt').readLines().each { line ->
-            def parts = line.split('\\|')
-            if (parts.size() == 2) {
-              def app = parts[0].toUpperCase()
-              def port = parts[1]
-              if (params["KILL_${app}"]) {
-                selected << "${app}|${port}"
-              }
-            }
-          }
-
-          writeFile file: 'final_targets.txt', text: selected.join('\n')
-          env.HAS_TARGETS = selected ? 'yes' : ''
-        }
-      }
-    }
-
-    // -------------------------------------------------
-    // Kill OS processes by PORT
-    // -------------------------------------------------
-    stage('Kill Processes') {
-      when { expression { env.HAS_TARGETS == 'yes' } }
-      steps {
-        bat '''
-          for /f "tokens=1,2 delims=|" %%A in (final_targets.txt) do (
-            echo Killing %%A
-            for /f "tokens=5" %%P in (
-              'netstat -ano ^| findstr LISTENING ^| findstr :%%B'
-            ) do taskkill /F /PID %%P >nul 2>&1
-          )
-        '''
-      }
-    }
-
-    // -------------------------------------------------
-    // Deregister instances from Eureka
-    // -------------------------------------------------
-    stage('Deregister from Eureka') {
-      when { expression { env.HAS_TARGETS == 'yes' } }
-      steps {
-        bat '''
-          for /f "tokens=1,2 delims=|" %%A in (final_targets.txt) do (
-            curl -s -X DELETE ^
-              http://localhost:%EUREKA_PORT%/eureka/apps/%%A >nul 2>&1
-          )
-        '''
-      }
-    }
-  }
-
-  post {
-    always {
-      echo "✅ KillInstances finished successfully."
-    }
-  }
-}
