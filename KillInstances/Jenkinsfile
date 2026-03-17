@@ -59,10 +59,16 @@ pipeline {
       steps {
         script {
 
-          // ✅ FIXED: single-line PowerShell, no caret inside string
-          bat '''
-            powershell -NoProfile -ExecutionPolicy Bypass -Command "[xml]$x = Get-Content 'apps.xml'; $x.applications.application | ForEach-Object { $_.name } | Set-Content 'services.txt'"
-          '''
+          // ✅ Write PowerShell script to extract service names
+          writeFile file: 'extract-services.ps1', text: '''
+[xml]$x = Get-Content "apps.xml"
+$x.applications.application | ForEach-Object {
+    $_.name
+} | Set-Content "services.txt"
+'''
+
+          // ✅ Execute PowerShell safely
+          bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
 
           def services = readFile('services.txt')
             .readLines()
@@ -119,18 +125,20 @@ pipeline {
       steps {
         script {
 
-          // ✅ FIXED: single-line PowerShell, no caret inside string
-          bat '''
-            powershell -NoProfile -ExecutionPolicy Bypass -Command @'
-            Select-Xml -Path "apps.xml" -XPath "//application" |
-            ForEach-Object {
-                $app = $_.Node.name
-                $_.Node.instance | ForEach-Object {
-                    "$app|$($_.port)"
-                }
-            } | Set-Content "all_targets.txt"
-            '@
-          '''
+          // ✅ Write PowerShell script to resolve ports
+          writeFile file: 'resolve-targets.ps1', text: '''
+[xml]$x = Get-Content "apps.xml"
+
+$x.applications.application | ForEach-Object {
+    $app = $_.name
+    $_.instance | ForEach-Object {
+        "$app|$($_.port)"
+    }
+} | Set-Content "all_targets.txt"
+'''
+
+          // ✅ Execute PowerShell safely
+          bat 'powershell -NoProfile -ExecutionPolicy Bypass -File resolve-targets.ps1'
 
           def selected = []
 
