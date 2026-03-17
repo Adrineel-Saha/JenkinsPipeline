@@ -2,6 +2,7 @@ pipeline {
   agent any
 
   stages {
+
     stage('Clean Workspace') {
       steps {
         deleteDir()
@@ -54,7 +55,7 @@ pipeline {
       steps {
         script {
 
-          // Extract application names safely using PowerShell XML
+          // Extract service names using PowerShell XML
           bat '''
             powershell -NoProfile -Command ^
               "[xml]$x = Get-Content apps.xml;" ^
@@ -102,10 +103,13 @@ pipeline {
             )
           }
 
+          // 🔴 IMPORTANT: clear existing parameters first
+          properties([])
+
           // Apply parameters for NEXT build
           properties([parameters(paramsList)])
 
-          echo "✅ Checkboxes prepared for next build based on Eureka state."
+          echo "✅ Parameters reset and recreated for next build."
           currentBuild.result = 'SUCCESS'
           return
         }
@@ -130,7 +134,7 @@ pipeline {
 
           def selected = []
 
-          // Eureka (explicit)
+          // Eureka explicitly
           if (params.KILL_EUREKA) {
             selected << "EUREKA|${env.EUREKA_PORT}"
           }
