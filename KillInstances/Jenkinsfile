@@ -28,7 +28,9 @@ pipeline {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
-          if (!m.find()) error "server.port not found in Eureka application.yml"
+          if (!m.find()) {
+            error "server.port not found in Eureka application.yml"
+          }
           env.EUREKA_PORT = m.group(1)
           echo "Eureka port from repo: ${env.EUREKA_PORT}"
         }
@@ -36,15 +38,18 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // Fetch Eureka registry (bootstrap call)
+    // Fetch Eureka registry (bootstrap, JSON forced)
+    // Uses machine hostname (NOT localhost)
     // -------------------------------------------------
     stage('Fetch Eureka Registry') {
       steps {
-        bat """
+        bat '''
           @echo on
+          for /f %%H in ('hostname') do set HOST=%%H
+          echo Using host %%HOST%%
           curl -s -H "Accept: application/json" ^
-            http://localhost:%EUREKA_PORT%/eureka/apps > apps.json
-        """
+            http://%%HOST%%:%EUREKA_PORT%/eureka/apps > apps.json
+        '''
       }
     }
 
@@ -54,33 +59,43 @@ pipeline {
     stage('Derive Eureka Base URL') {
       steps {
         script {
-          def root = new groovy.json.JsonSlurper().parseText(readFile('apps.json'))
-          def apps = root?.applications?.application
+          def apps = new groovy.json.JsonSlurper()
+            .parseText(readFile('apps.json'))
+            ?.applications
+            ?.application
+
           if (apps instanceof Map) apps = [apps]
 
-          def eurekaApp = apps.find { it.name?.toString()?.toUpperCase() == 'EUREKA' }
-          if (!eurekaApp) error "EUREKA application not found in registry"
+          def eurekaApp = apps.find {
+            it.name?.toString()?.toUpperCase() == 'EUREKA'
+          }
+          if (!eurekaApp) {
+            error "EUREKA application not found in registry"
+          }
 
           def inst = eurekaApp.instance
           if (inst instanceof List) inst = inst[0]
 
-          def host = inst.hostName.toString()
-          def port = inst.port['$'].toString()
+          env.EUREKA_HOST = inst.hostName.toString()
+          env.EUREKA_REG_PORT = inst.port['$'].toString()
+          env.EUREKA_BASE_URL = "http://${env.EUREKA_HOST}:${env.EUREKA_REG_PORT}"
 
-          env.EUREKA_BASE_URL = "http://${host}:${port}"
           echo "Derived Eureka Base URL: ${env.EUREKA_BASE_URL}"
         }
       }
     }
 
     // -------------------------------------------------
-    // Create checkboxes for ALL services
+    // Create checkboxes for ALL services (from Eureka)
     // -------------------------------------------------
     stage('Create Service Checkboxes') {
       steps {
         script {
-          def root = new groovy.json.JsonSlurper().parseText(readFile('apps.json'))
-          def apps = root?.applications?.application
+          def apps = new groovy.json.JsonSlurper()
+            .parseText(readFile('apps.json'))
+            ?.applications
+            ?.application
+
           if (apps instanceof Map) apps = [apps]
 
           def paramsList = []
@@ -104,8 +119,11 @@ pipeline {
     stage('Resolve Selected Instances') {
       steps {
         script {
-          def root = new groovy.json.JsonSlurper().parseText(readFile('apps.json'))
-          def apps = root?.applications?.application
+          def apps = new groovy.json.JsonSlurper()
+            .parseText(readFile('apps.json'))
+            ?.applications
+            ?.application
+
           if (apps instanceof Map) apps = [apps]
 
           def targets = []
@@ -148,25 +166,25 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // Deregister from Eureka (NO hardcoded URL)
+    // Deregister instances from Eureka (NO hardcoding)
     // -------------------------------------------------
     stage('Deregister from Eureka') {
       when { expression { env.HAS_TARGETS == 'yes' } }
       steps {
-        bat """
+        bat '''
           @echo on
           for /f "tokens=1,2,3 delims=|" %%A in (targets.txt) do (
             curl -s -X DELETE ^
               %EUREKA_BASE_URL%/eureka/apps/%%A/%%C >nul 2>&1
           )
-        """
+        '''
       }
     }
   }
 
   post {
     always {
-      echo "KillInstances completed with ZERO hardcoded Eureka values."
+      echo "KillInstances completed with NO hardcoded Eureka host or port."
     }
   }
 }
