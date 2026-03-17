@@ -7,6 +7,9 @@ pipeline {
       steps { deleteDir() }
     }
 
+    // -------------------------------------------------
+    // Clone ONLY EurekaServer
+    // -------------------------------------------------
     stage('Clone EurekaServer Repo') {
       steps {
         dir('eureka') {
@@ -15,6 +18,9 @@ pipeline {
       }
     }
 
+    // -------------------------------------------------
+    // Read Eureka server.port from application.yml
+    // -------------------------------------------------
     stage('Read Eureka Port from application.yml') {
       steps {
         script {
@@ -27,6 +33,9 @@ pipeline {
       }
     }
 
+    // -------------------------------------------------
+    // Fetch Eureka registry (XML)
+    // -------------------------------------------------
     stage('Fetch Eureka Registry (XML)') {
       steps {
         bat '''
@@ -36,14 +45,16 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // ✅ Extract ONLY application names (PowerShell XML)
+    // ✅ Create checkboxes (EUREKA + services from XML)
     // -------------------------------------------------
     stage('Create Service Checkboxes') {
       steps {
         script {
+
+          // --- Extract service names using PowerShell (XML-safe) ---
           bat '''
             powershell -NoProfile -Command ^
-              "$xml = [xml](Get-Content apps.xml);" ^
+              "$xml = Get-Content apps.xml;" ^
               "$xml.applications.application | ForEach-Object { $_.name } | Set-Content services.txt"
           '''
 
@@ -53,6 +64,15 @@ pipeline {
             .unique()
 
           def paramsList = []
+
+          // ✅ Always add Eureka checkbox explicitly
+          paramsList << booleanParam(
+            name: 'KILL_EUREKA',
+            defaultValue: false,
+            description: 'Kill Eureka Server'
+          )
+
+          // ✅ Add application checkboxes
           services.each { svc ->
             paramsList << booleanParam(
               name: "KILL_${svc}",
@@ -62,7 +82,8 @@ pipeline {
           }
 
           properties([parameters(paramsList)])
-          echo "✅ Correct service checkboxes created. Re-run with 'Build with Parameters'."
+
+          echo "✅ Checkboxes created (Eureka + services). Re-run with 'Build with Parameters'."
           currentBuild.result = 'SUCCESS'
           return
         }
@@ -70,14 +91,16 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // ✅ Resolve ports for SELECTED services
+    // Resolve targets (Eureka + selected services)
     // -------------------------------------------------
     stage('Resolve Selected Instances') {
       steps {
         script {
+
+          // --- Resolve application ports from XML ---
           bat '''
             powershell -NoProfile -Command ^
-              "$xml = [xml](Get-Content apps.xml);" ^
+              "$xml = Get-Content apps.xml;" ^
               "$xml.applications.application | ForEach-Object { " ^
               "  $app=$_.name; " ^
               "  $_.instance | ForEach-Object { \"$app|$($_.port)\" } " ^
@@ -85,6 +108,13 @@ pipeline {
           '''
 
           def selected = []
+
+          // ✅ Handle Eureka explicitly
+          if (params.KILL_EUREKA) {
+            selected << "EUREKA|${env.EUREKA_PORT}"
+          }
+
+          // ✅ Handle application services
           readFile('all_targets.txt').readLines().each { line ->
             def parts = line.split('\\|')
             if (parts.size() == 2) {
@@ -102,11 +132,15 @@ pipeline {
       }
     }
 
+    // -------------------------------------------------
+    // Kill OS processes by PORT
+    // -------------------------------------------------
     stage('Kill Processes') {
       when { expression { env.HAS_TARGETS == 'yes' } }
       steps {
         bat '''
           for /f "tokens=1,2 delims=|" %%A in (final_targets.txt) do (
+            echo Killing %%A on port %%B
             for /f "tokens=5" %%P in (
               'netstat -ano ^| findstr LISTENING ^| findstr :%%B'
             ) do taskkill /F /PID %%P >nul 2>&1
@@ -115,6 +149,9 @@ pipeline {
       }
     }
 
+    // -------------------------------------------------
+    // Deregister instances from Eureka
+    // -------------------------------------------------
     stage('Deregister from Eureka') {
       when { expression { env.HAS_TARGETS == 'yes' } }
       steps {
@@ -130,7 +167,7 @@ pipeline {
 
   post {
     always {
-      echo "✅ KillInstances finished successfully (PowerShell XML parsing, no KILL_NAME)."
+      echo "✅ KillInstances finished successfully (Eureka checkbox + XML services)."
     }
   }
 }
