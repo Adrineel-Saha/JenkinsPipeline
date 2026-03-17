@@ -4,14 +4,9 @@ pipeline {
   stages {
 
     stage('Clean Workspace') {
-      steps {
-        deleteDir()
-      }
+      steps { deleteDir() }
     }
 
-    // -------------------------------------------------
-    // Clone ONLY EurekaServer
-    // -------------------------------------------------
     stage('Clone EurekaServer Repo') {
       steps {
         dir('eureka') {
@@ -20,9 +15,6 @@ pipeline {
       }
     }
 
-    // -------------------------------------------------
-    // Read Eureka server.port from application.yml
-    // -------------------------------------------------
     stage('Read Eureka Port from application.yml') {
       steps {
         script {
@@ -35,35 +27,24 @@ pipeline {
       }
     }
 
-    // -------------------------------------------------
-    // Fetch Eureka registry (XML)
-    // -------------------------------------------------
-    stage('Fetch Eureka Registry') {
+    stage('Fetch Eureka Registry (XML)') {
       steps {
         bat '''
-          @echo on
           curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
         '''
       }
     }
 
     // -------------------------------------------------
-    // Extract application names (SAFE)
+    // ✅ Extract ONLY application names (PowerShell XML)
     // -------------------------------------------------
-    stage('Extract Services & Create Checkboxes') {
+    stage('Create Service Checkboxes') {
       steps {
         script {
           bat '''
-            @echo off
-            del services.txt >nul 2>&1
-
-            rem Extract ONLY <application><name> values
-            findstr "<application>" apps.xml > app_blocks.txt
-            findstr "<name>" apps.xml | findstr /V "<hostName>" > raw_names.txt
-
-            for /f "tokens=2 delims=<>" %%A in (raw_names.txt) do (
-              echo %%A>>services.txt
-            )
+            powershell -NoProfile -Command ^
+              "$xml = [xml](Get-Content apps.xml);" ^
+              "$xml.applications.application | ForEach-Object { $_.name } | Set-Content services.txt"
           '''
 
           def services = readFile('services.txt')
@@ -81,7 +62,7 @@ pipeline {
           }
 
           properties([parameters(paramsList)])
-          echo "Checkboxes created. Re-run using 'Build with Parameters'."
+          echo "✅ Correct service checkboxes created. Re-run with 'Build with Parameters'."
           currentBuild.result = 'SUCCESS'
           return
         }
@@ -89,38 +70,22 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // Resolve ports for selected services
+    // ✅ Resolve ports for SELECTED services
     // -------------------------------------------------
     stage('Resolve Selected Instances') {
       steps {
         script {
           bat '''
-            @echo off
-            del targets.txt >nul 2>&1
-
-            rem Extract names and ports in order
-            findstr "<name>" apps.xml | findstr /V "<hostName>" > names.txt
-            findstr "<port>" apps.xml > ports.txt
-
-            rem Pair name + port by line number
-            setlocal EnableDelayedExpansion
-            set i=0
-
-            for /f "tokens=2 delims=<>" %%N in (names.txt) do (
-              set /a i+=1
-              for /f "tokens=2 delims=<>" %%P in ('more +!i! ports.txt ^| findstr "<port>"') do (
-                echo %%N^|%%P>>targets.txt
-                goto :next
-              )
-              :next
-            )
-            endlocal
+            powershell -NoProfile -Command ^
+              "$xml = [xml](Get-Content apps.xml);" ^
+              "$xml.applications.application | ForEach-Object { " ^
+              "  $app=$_.name; " ^
+              "  $_.instance | ForEach-Object { \"$app|$($_.port)\" } " ^
+              "} | Set-Content all_targets.txt"
           '''
 
           def selected = []
-          def lines = fileExists('targets.txt') ? readFile('targets.txt').readLines() : []
-
-          lines.each { line ->
+          readFile('all_targets.txt').readLines().each { line ->
             def parts = line.split('\\|')
             if (parts.size() == 2) {
               def app = parts[0].toUpperCase()
@@ -137,16 +102,11 @@ pipeline {
       }
     }
 
-    // -------------------------------------------------
-    // Kill OS processes by PORT
-    // -------------------------------------------------
     stage('Kill Processes') {
       when { expression { env.HAS_TARGETS == 'yes' } }
       steps {
         bat '''
-          @echo on
           for /f "tokens=1,2 delims=|" %%A in (final_targets.txt) do (
-            echo Killing %%A on port %%B
             for /f "tokens=5" %%P in (
               'netstat -ano ^| findstr LISTENING ^| findstr :%%B'
             ) do taskkill /F /PID %%P >nul 2>&1
@@ -155,14 +115,10 @@ pipeline {
       }
     }
 
-    // -------------------------------------------------
-    // Deregister from Eureka
-    // -------------------------------------------------
     stage('Deregister from Eureka') {
       when { expression { env.HAS_TARGETS == 'yes' } }
       steps {
         bat '''
-          @echo on
           for /f "tokens=1,2 delims=|" %%A in (final_targets.txt) do (
             curl -s -X DELETE ^
               http://localhost:%EUREKA_PORT%/eureka/apps/%%A >nul 2>&1
@@ -174,7 +130,7 @@ pipeline {
 
   post {
     always {
-      echo "KillInstances finished successfully (XML-only, sandbox-safe, stable)."
+      echo "✅ KillInstances finished successfully (PowerShell XML parsing, no KILL_NAME)."
     }
   }
 }
