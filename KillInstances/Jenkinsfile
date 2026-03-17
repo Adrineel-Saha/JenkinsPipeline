@@ -2,9 +2,10 @@ pipeline {
   agent any
 
   stages {
-
     stage('Clean Workspace') {
-      steps { deleteDir() }
+      steps {
+        deleteDir()
+      }
     }
 
     // -------------------------------------------------
@@ -26,7 +27,9 @@ pipeline {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
-          if (!m.find()) error "server.port not found in Eureka application.yml"
+          if (!m.find()) {
+            error "server.port not found in Eureka application.yml"
+          }
           env.EUREKA_PORT = m.group(1)
           echo "Eureka port resolved."
         }
@@ -34,26 +37,7 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // Create Eureka checkbox explicitly (NO XML)
-    // -------------------------------------------------
-    stage('Create Eureka Checkbox') {
-      steps {
-        script {
-          properties([
-            parameters([
-              booleanParam(
-                name: 'KILL_EUREKA',
-                defaultValue: false,
-                description: 'Kill Eureka Server'
-              )
-            ])
-          ])
-        }
-      }
-    }
-
-    // -------------------------------------------------
-    // Fetch Eureka registry (XML – services only)
+    // Fetch Eureka registry (XML)
     // -------------------------------------------------
     stage('Fetch Eureka Registry (XML)') {
       steps {
@@ -64,11 +48,13 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // Create service checkboxes from XML (PowerShell)
+    // Create checkboxes (NEXT BUILD defaults)
     // -------------------------------------------------
-    stage('Create Service Checkboxes from XML') {
+    stage('Create Service Checkboxes') {
       steps {
         script {
+
+          // Extract application names safely using PowerShell XML
           bat '''
             powershell -NoProfile -Command ^
               "[xml]$x = Get-Content apps.xml;" ^
@@ -78,26 +64,48 @@ pipeline {
           def services = readFile('services.txt')
             .readLines()
             .collect { it.trim().toUpperCase() }
+            .findAll { it }
             .unique()
 
-          def serviceParams = []
-          services.each { svc ->
-            serviceParams << booleanParam(
+          echo "Services currently in Eureka: ${services}"
+
+          def paramsList = []
+
+          // -------------------------------------------------
+          // Eureka checkbox
+          // Enabled by default ONLY if no services exist
+          // -------------------------------------------------
+          paramsList << booleanParam(
+            name: 'KILL_EUREKA',
+            defaultValue: services.isEmpty(),
+            description: 'Kill Eureka Server'
+          )
+
+          // -------------------------------------------------
+          // Config Server checkbox
+          // Enabled by default ONLY if it is the only service
+          // -------------------------------------------------
+          paramsList << booleanParam(
+            name: 'KILL_CONFIGSERVER',
+            defaultValue: (services == ['CONFIGSERVER']),
+            description: 'Kill Config Server'
+          )
+
+          // -------------------------------------------------
+          // Other services (always unchecked by default)
+          // -------------------------------------------------
+          services.findAll { it != 'CONFIGSERVER' }.each { svc ->
+            paramsList << booleanParam(
               name: "KILL_${svc}",
               defaultValue: false,
               description: "Kill ${svc}"
             )
           }
 
-          // Merge Eureka checkbox + service checkboxes
-          properties([
-            parameters(
-              [booleanParam(name: 'KILL_EUREKA', defaultValue: false, description: 'Kill Eureka Server')]
-              + serviceParams
-            )
-          ])
+          // Apply parameters for NEXT build
+          properties([parameters(paramsList)])
 
-          echo "✅ Service checkboxes created. Re-run using 'Build with Parameters'."
+          echo "✅ Checkboxes prepared for next build based on Eureka state."
           currentBuild.result = 'SUCCESS'
           return
         }
@@ -122,7 +130,7 @@ pipeline {
 
           def selected = []
 
-          // Eureka explicitly
+          // Eureka (explicit)
           if (params.KILL_EUREKA) {
             selected << "EUREKA|${env.EUREKA_PORT}"
           }
@@ -180,7 +188,7 @@ pipeline {
 
   post {
     always {
-      echo "✅ KillInstances finished successfully."
+      echo "✅ KillInstances pipeline finished successfully."
     }
   }
 }
