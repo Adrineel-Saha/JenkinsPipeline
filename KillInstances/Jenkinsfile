@@ -38,7 +38,7 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // Fetch Eureka registry (JSON forced, localhost OK)
+    // Fetch Eureka registry (JSON forced)
     // -------------------------------------------------
     stage('Fetch Eureka Registry') {
       steps {
@@ -47,35 +47,6 @@ pipeline {
           curl -s -H "Accept: application/json" ^
             http://localhost:%EUREKA_PORT%/eureka/apps > apps.json
         '''
-      }
-    }
-
-    // -------------------------------------------------
-    // Derive Eureka Base URL from registry itself
-    // -------------------------------------------------
-    stage('Derive Eureka Base URL') {
-      steps {
-        script {
-          def apps = new groovy.json.JsonSlurper()
-            .parseText(readFile('apps.json'))
-            ?.applications?.application
-
-          if (apps instanceof Map) apps = [apps]
-
-          def eurekaApp = apps.find {
-            it.name?.toString()?.toUpperCase() == 'EUREKA'
-          }
-          if (!eurekaApp) {
-            error "EUREKA application not found in registry"
-          }
-
-          def inst = eurekaApp.instance
-          if (inst instanceof List) inst = inst[0]
-
-          // Use Eureka’s self-reported URL (protocol + host + port)
-          env.EUREKA_BASE_URL = inst.homePageUrl.toString().replaceAll('/$', '')
-          echo "Derived Eureka Base URL: ${env.EUREKA_BASE_URL}"
-        }
       }
     }
 
@@ -94,89 +65,3 @@ pipeline {
           def paramsList = []
           apps.each { app ->
             def name = app.name.toString().toUpperCase()
-            paramsList << booleanParam(
-              name: "KILL_${name}",
-              defaultValue: false,
-              description: "Kill all instances of ${name}"
-            )
-          }
-
-          properties([parameters(paramsList)])
-        }
-      }
-    }
-
-    // -------------------------------------------------
-    // Resolve selected instances (ports from Eureka)
-    // -------------------------------------------------
-    stage('Resolve Selected Instances') {
-      steps {
-        script {
-          def apps = new groovy.json.JsonSlurper()
-            .parseText(readFile('apps.json'))
-            ?.applications?.application
-
-          if (apps instanceof Map) apps = [apps]
-
-          def targets = []
-
-          apps.each { app ->
-            def appName = app.name.toString().toUpperCase()
-            if (params["KILL_${appName}"]) {
-              def insts = app.instance
-              if (insts instanceof Map) insts = [insts]
-
-              insts.each { inst ->
-                def port = inst.port['$'].toString()
-                targets << "${appName}|${port}|${inst.instanceId}"
-              }
-            }
-          }
-
-          writeFile file: 'targets.txt', text: targets.join('\n')
-          env.HAS_TARGETS = targets ? 'yes' : ''
-        }
-      }
-    }
-
-    // -------------------------------------------------
-    // Kill OS processes by PORT
-    // -------------------------------------------------
-    stage('Kill Processes') {
-      when { expression { env.HAS_TARGETS == 'yes' } }
-      steps {
-        bat '''
-          @echo on
-          for /f "tokens=1,2,3 delims=|" %%A in (targets.txt) do (
-            echo Killing %%A on port %%B
-            for /f "tokens=5" %%P in (
-              'netstat -ano -p tcp ^| findstr LISTENING ^| findstr :%%B'
-            ) do taskkill /F /PID %%P >nul 2>&1
-          )
-        '''
-      }
-    }
-
-    // -------------------------------------------------
-    // Deregister instances from Eureka
-    // -------------------------------------------------
-    stage('Deregister from Eureka') {
-      when { expression { env.HAS_TARGETS == 'yes' } }
-      steps {
-        bat '''
-          @echo on
-          for /f "tokens=1,2,3 delims=|" %%A in (targets.txt) do (
-            curl -s -X DELETE ^
-              %EUREKA_BASE_URL%/eureka/apps/%%A/%%C >nul 2>&1
-          )
-        '''
-      }
-    }
-  }
-
-  post {
-    always {
-      echo "KillInstances completed successfully using localhost."
-    }
-  }
-}
