@@ -38,30 +38,27 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // Fetch Eureka registry (JSON forced)
-    // NOTE: no localhost, no hostname, no protocol guessing
+    // Fetch Eureka registry (JSON forced, localhost OK)
     // -------------------------------------------------
     stage('Fetch Eureka Registry') {
       steps {
         bat '''
           @echo on
           curl -s -H "Accept: application/json" ^
-            /eureka/apps > apps.json
+            http://localhost:%EUREKA_PORT%/eureka/apps > apps.json
         '''
       }
     }
 
     // -------------------------------------------------
     // Derive Eureka Base URL from registry itself
-    // (NO http, NO host, NO port hardcoding)
     // -------------------------------------------------
     stage('Derive Eureka Base URL') {
       steps {
         script {
           def apps = new groovy.json.JsonSlurper()
             .parseText(readFile('apps.json'))
-            ?.applications
-            ?.application
+            ?.applications?.application
 
           if (apps instanceof Map) apps = [apps]
 
@@ -75,10 +72,8 @@ pipeline {
           def inst = eurekaApp.instance
           if (inst instanceof List) inst = inst[0]
 
-          // ✅ Use homepage URL directly (contains protocol + host + port)
-          def baseUrl = inst.homePageUrl.toString().replaceAll('/$', '')
-          env.EUREKA_BASE_URL = baseUrl
-
+          // Use Eureka’s self-reported URL (protocol + host + port)
+          env.EUREKA_BASE_URL = inst.homePageUrl.toString().replaceAll('/$', '')
           echo "Derived Eureka Base URL: ${env.EUREKA_BASE_URL}"
         }
       }
@@ -92,8 +87,7 @@ pipeline {
         script {
           def apps = new groovy.json.JsonSlurper()
             .parseText(readFile('apps.json'))
-            ?.applications
-            ?.application
+            ?.applications?.application
 
           if (apps instanceof Map) apps = [apps]
 
@@ -120,8 +114,7 @@ pipeline {
         script {
           def apps = new groovy.json.JsonSlurper()
             .parseText(readFile('apps.json'))
-            ?.applications
-            ?.application
+            ?.applications?.application
 
           if (apps instanceof Map) apps = [apps]
 
@@ -165,7 +158,7 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // Deregister from Eureka (NO hardcoded values)
+    // Deregister instances from Eureka
     // -------------------------------------------------
     stage('Deregister from Eureka') {
       when { expression { env.HAS_TARGETS == 'yes' } }
@@ -183,7 +176,7 @@ pipeline {
 
   post {
     always {
-      echo "KillInstances completed with ZERO hardcoded host, port, or protocol."
+      echo "KillInstances completed successfully using localhost."
     }
   }
 }
