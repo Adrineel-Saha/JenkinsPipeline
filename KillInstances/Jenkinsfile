@@ -4,9 +4,7 @@ pipeline {
   stages {
 
     stage('Clean Workspace') {
-      steps {
-        deleteDir()
-      }
+      steps { deleteDir() }
     }
 
     // -------------------------------------------------
@@ -28,9 +26,7 @@ pipeline {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
-          if (!m.find()) {
-            error "server.port not found in Eureka application.yml"
-          }
+          if (!m.find()) error "server.port not found in Eureka application.yml"
           env.EUREKA_PORT = m.group(1)
           echo "Eureka port resolved."
         }
@@ -38,7 +34,7 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // Fetch Eureka registry (XML)
+    // Fetch Eureka registry (XML – services only)
     // -------------------------------------------------
     stage('Fetch Eureka Registry (XML)') {
       steps {
@@ -49,13 +45,13 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // Create checkboxes (NEXT BUILD defaults)
+    // ✅ Create checkboxes (SHOW / HIDE based on condition)
     // -------------------------------------------------
     stage('Create Service Checkboxes') {
       steps {
         script {
 
-          // Extract service names using PowerShell XML
+          // Extract application names from XML
           bat '''
             powershell -NoProfile -Command ^
               "[xml]$x = Get-Content apps.xml;" ^
@@ -73,27 +69,29 @@ pipeline {
           def paramsList = []
 
           // -------------------------------------------------
-          // Eureka checkbox
-          // Enabled by default ONLY if no services exist
+          // SHOW KILL_EUREKA only if NO services exist
           // -------------------------------------------------
-          paramsList << booleanParam(
-            name: 'KILL_EUREKA',
-            defaultValue: services.isEmpty(),
-            description: 'Kill Eureka Server'
-          )
+          if (services.isEmpty()) {
+            paramsList << booleanParam(
+              name: 'KILL_EUREKA',
+              defaultValue: false,
+              description: 'Kill Eureka Server'
+            )
+          }
 
           // -------------------------------------------------
-          // Config Server checkbox
-          // Enabled by default ONLY if it is the only service
+          // SHOW KILL_CONFIGSERVER only if it is the ONLY service
           // -------------------------------------------------
-          paramsList << booleanParam(
-            name: 'KILL_CONFIGSERVER',
-            defaultValue: (services == ['CONFIGSERVER']),
-            description: 'Kill Config Server'
-          )
+          if (services == ['CONFIGSERVER']) {
+            paramsList << booleanParam(
+              name: 'KILL_CONFIGSERVER',
+              defaultValue: false,
+              description: 'Kill Config Server'
+            )
+          }
 
           // -------------------------------------------------
-          // Other services (always unchecked by default)
+          // SHOW other services always (except CONFIGSERVER)
           // -------------------------------------------------
           services.findAll { it != 'CONFIGSERVER' }.each { svc ->
             paramsList << booleanParam(
@@ -103,13 +101,11 @@ pipeline {
             )
           }
 
-          // 🔴 IMPORTANT: clear existing parameters first
+          // Reset and apply parameters for NEXT build
           properties([])
-
-          // Apply parameters for NEXT build
           properties([parameters(paramsList)])
 
-          echo "✅ Parameters reset and recreated for next build."
+          echo "✅ Checkboxes created using SHOW/HIDE logic. Re-run with 'Build with Parameters'."
           currentBuild.result = 'SUCCESS'
           return
         }
@@ -192,7 +188,7 @@ pipeline {
 
   post {
     always {
-      echo "✅ KillInstances pipeline finished successfully."
+      echo "✅ KillInstances finished successfully."
     }
   }
 }
