@@ -125,7 +125,7 @@ ForEach-Object {
     // -------------------------------------------------
     // Fetch Eureka registry (After DEREGISTER)
     // -------------------------------------------------
-    stage('Fetch Eureka Registry (XML)') {
+    stage('Fetch Eureka Registry (XML After DEREGISTER)') {
       steps {
         bat '''
           del apps.xml >nul 2>&1
