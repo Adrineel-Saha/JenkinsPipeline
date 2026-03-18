@@ -19,20 +19,15 @@ pipeline {
       steps {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
-
-          // ✅ DO NOT CHANGE REGEX
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
           if (!m.find()) error "server.port not found"
-
           env.EUREKA_PORT = m.group(1)
           echo "Eureka port resolved: ${env.EUREKA_PORT}"
         }
       }
     }
 
-    // -------------------------------------------------
-    // ALWAYS fetch Eureka once per build
-    // -------------------------------------------------
+    // ✅ Always fetch fresh Eureka registry
     stage('Fetch Eureka Registry (XML)') {
       steps {
         bat '''
@@ -42,9 +37,7 @@ pipeline {
       }
     }
 
-    // -------------------------------------------------
-    // ✅ CREATE CHECKBOXES (SINGLE SOURCE OF TRUTH)
-    // -------------------------------------------------
+    // ✅ Create checkboxes (only place)
     stage('Create Service Checkboxes') {
       steps {
         script {
@@ -96,14 +89,16 @@ Set-Content "services.txt"
             )
           }
 
-          // ✅ Replace parameters (affects NEXT build)
+          // ✅ Replace parameters for NEXT build
           properties([
             [$class: 'ParametersDefinitionProperty',
              parameterDefinitions: paramsList]
           ])
 
-          // ✅ FIRST BUILD → exit cleanly
-          if (params.isEmpty()) {
+          // ✅ Detect execution capability correctly
+          def hasKillParams = params.keySet().any { it.startsWith('KILL_') }
+
+          if (!hasKillParams) {
             echo "ℹ First build initializes parameters. Re-run using 'Build with Parameters'."
             return
           }
@@ -111,11 +106,13 @@ Set-Content "services.txt"
       }
     }
 
-    // -------------------------------------------------
-    // EXECUTION STAGES (SECOND BUILD ONWARD)
-    // -------------------------------------------------
+    // ✅ Execution stages only when KILL_* params exist
     stage('Resolve Selected Instances') {
-      when { expression { !params.isEmpty() } }
+      when {
+        expression {
+          params.keySet().any { it.startsWith('KILL_') }
+        }
+      }
       steps {
         script {
 
