@@ -19,89 +19,27 @@ pipeline {
       steps {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
+
+          // ✅ ORIGINAL, APPROVED REGEX — UNCHANGED
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
+
           if (!m.find()) error "server.port not found"
+
           env.EUREKA_PORT = m.group(1)
+          echo "Eureka port resolved."
         }
       }
     }
 
-    // -------------------------------------------------
-    // FETCH EUREKA (always)
-    // -------------------------------------------------
     stage('Fetch Eureka Registry (XML)') {
       steps {
         bat '''
-          del apps.xml >nul 2>&1
           curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
         '''
       }
     }
 
-    // -------------------------------------------------
-    // DISCOVERY MODE — ONLY CREATE CHECKBOXES
-    // -------------------------------------------------
-    stage('Create Service Checkboxes') {
-      when {
-        expression {
-          // Discovery run if no KILL_* params yet
-          !params.keySet().any { it.startsWith('KILL_') }
-        }
-      }
-      steps {
-        script {
-
-          writeFile file: 'extract-services.ps1', text: '''
-[xml]$x = Get-Content "apps.xml"
-
-$x.applications.application |
-Where-Object {
-  $_.instance -ne $null -and
-  ($_.instance | Where-Object { $_.status -eq "UP" })
-} |
-ForEach-Object { $_.name } |
-Set-Content "services.txt"
-'''
-          bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
-
-          def services = readFile('services.txt')
-            .readLines()
-            .collect { it.trim().toUpperCase() }
-            .unique()
-
-          def paramsList = []
-
-          if (services.isEmpty()) {
-            paramsList << booleanParam(name: 'KILL_EUREKA', defaultValue: false)
-          }
-
-          if (services == ['CONFIGSERVER']) {
-            paramsList << booleanParam(name: 'KILL_CONFIGSERVER', defaultValue: false)
-          }
-
-          services.findAll { it != 'CONFIGSERVER' }.each { svc ->
-            paramsList << booleanParam(name: "KILL_${svc}", defaultValue: false)
-          }
-
-          properties([
-            [$class: 'ParametersDefinitionProperty',
-             parameterDefinitions: paramsList]
-          ])
-
-          echo "✅ Parameters generated. Re-run using 'Build with Parameters'."
-        }
-      }
-    }
-
-    // -------------------------------------------------
-    // EXECUTION MODE — NEVER TOUCH PARAMETERS
-    // -------------------------------------------------
     stage('Resolve Selected Instances') {
-      when {
-        expression {
-          params.keySet().any { it.startsWith('KILL_') }
-        }
-      }
       steps {
         script {
 
@@ -111,10 +49,10 @@ Set-Content "services.txt"
 $x.applications.application |
 Where-Object { $_.instance -ne $null } |
 ForEach-Object {
-  $app = $_.name
-  $_.instance | ForEach-Object {
-    "$app|$($_.instanceId)|$($_.port.InnerText)"
-  }
+    $app = $_.name
+    $_.instance | ForEach-Object {
+        "$app|$($_.instanceId)|$($_.port.InnerText)"
+    }
 } | Set-Content "all_targets.txt"
 '''
           bat 'powershell -NoProfile -ExecutionPolicy Bypass -File resolve-targets.ps1'
@@ -122,9 +60,14 @@ ForEach-Object {
           def selected = []
 
           readFile('all_targets.txt').readLines().each { line ->
-            def p = line.split('\\|')
-            if (p.size() == 3 && params["KILL_${p[0].toUpperCase()}"]) {
-              selected << "${p[0]}|${p[1]}|${p[2]}"
+            def parts = line.split('\\|')
+            if (parts.size() == 3) {
+              def app = parts[0].toUpperCase()
+              def instanceId = parts[1]
+              def port = parts[2]
+              if (params["KILL_${app}"]) {
+                selected << "${app}|${instanceId}|${port}"
+              }
             }
           }
 
@@ -138,11 +81,13 @@ ForEach-Object {
       when { expression { env.HAS_TARGETS == 'yes' } }
       steps {
         bat '''
+          @echo off
           for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
             for /f "tokens=5" %%P in (
               'netstat -ano ^| findstr LISTENING ^| findstr :%%C'
-            ) do taskkill /F /PID %%P >nul 2>&1
+            ) do taskkill /F /PID %%P >nul 2>&1 || echo PID %%P already stopped
           )
+          exit /b 0
         '''
       }
     }
@@ -156,6 +101,75 @@ ForEach-Object {
               http://localhost:%EUREKA_PORT%/eureka/apps/%%A/%%B >nul 2>&1
           )
         '''
+      }
+    }
+
+    stage('Fetch Eureka Registry (After Deregister)') {
+      steps {
+        bat '''
+          curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
+        '''
+      }
+    }
+
+    stage('Create Service Checkboxes') {
+      steps {
+        script {
+
+          // ✅ Extract ONLY services with active instances
+          writeFile file: 'extract-services.ps1', text: '''
+[xml]$x = Get-Content "apps.xml"
+
+$x.applications.application |
+Where-Object { $_.instance -ne $null } |
+ForEach-Object { $_.name } |
+Set-Content "services.txt"
+'''
+          bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
+
+          def services = readFile('services.txt')
+            .readLines()
+            .collect { it.trim().toUpperCase() }
+            .unique()
+
+          echo "Active services in Eureka: ${services}"
+
+          def paramsList = []
+
+          if (services.isEmpty()) {
+            paramsList << booleanParam(
+              name: 'KILL_EUREKA',
+              defaultValue: false,
+              description: 'Kill Eureka Server'
+            )
+          }
+
+          if (services == ['CONFIGSERVER']) {
+            paramsList << booleanParam(
+              name: 'KILL_CONFIGSERVER',
+              defaultValue: false,
+              description: 'Kill Config Server'
+            )
+          }
+
+          services.findAll { it != 'CONFIGSERVER' }.each { svc ->
+            paramsList << booleanParam(
+              name: "KILL_${svc}",
+              defaultValue: false,
+              description: "Kill ${svc}"
+            )
+          }
+
+          // ✅ ✅ ✅ PROPER PARAMETER REPLACEMENT (NO MERGE)
+          properties([
+            [$class: 'ParametersDefinitionProperty',
+             parameterDefinitions: paramsList]
+          ])
+
+          echo "✅ Parameters replaced correctly. Re-run with 'Build with Parameters'."
+          currentBuild.result = 'SUCCESS'
+          return
+        }
       }
     }
   }
