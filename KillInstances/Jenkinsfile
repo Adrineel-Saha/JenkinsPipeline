@@ -35,7 +35,84 @@ pipeline {
       }
     }
 
+
     // -------------------------------------------------
+    // Resolve instanceId + port
+    // -------------------------------------------------
+    stage('Resolve Selected Instances') {
+      steps {
+        script {
+
+          writeFile file: 'resolve-targets.ps1', text: '''
+[xml]$x = Get-Content "apps.xml"
+
+$x.applications.application |
+Where-Object { $_.instance -ne $null } |
+ForEach-Object {
+  $app = $_.name
+  $_.instance | ForEach-Object {
+    "$app|$($_.instanceId)|$($_.port.InnerText)"
+  }
+} | Set-Content "all_targets.txt"
+'''
+          bat 'powershell -NoProfile -ExecutionPolicy Bypass -File resolve-targets.ps1'
+
+          def selected = []
+
+          readFile('all_targets.txt').readLines().each { line ->
+            def parts = line.split('\\|')
+            if (parts.size() == 3) {
+              def app = parts[0].toUpperCase()
+              def instanceId = parts[1]
+              def port = parts[2]
+
+              if (params["KILL_${app}"]) {
+                selected << "${app}|${instanceId}|${port}"
+              }
+            }
+          }
+
+          writeFile file: 'final_targets.txt', text: selected.join('\n')
+          env.HAS_TARGETS = selected ? 'yes' : ''
+        }
+      }
+    }
+
+    // -------------------------------------------------
+    // Kill OS processes (exit-safe)
+    // -------------------------------------------------
+    stage('Kill Processes') {
+      when { expression { env.HAS_TARGETS == 'yes' } }
+      steps {
+        bat '''
+          @echo off
+          for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
+            for /f "tokens=5" %%P in (
+              'netstat -ano ^| findstr LISTENING ^| findstr :%%C'
+            ) do taskkill /F /PID %%P >nul 2>&1 || echo PID %%P already stopped
+          )
+          exit /b 0
+        '''
+      }
+    }
+
+    // -------------------------------------------------
+    // Deregister using INSTANCE_ID
+    // -------------------------------------------------
+    stage('Deregister from Eureka') {
+      when { expression { env.HAS_TARGETS == 'yes' } }
+      steps {
+        bat '''
+          for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
+            curl -s -X DELETE ^
+              http://localhost:%EUREKA_PORT%/eureka/apps/%%A/%%B >nul 2>&1
+          )
+        '''
+      }
+    }
+  }
+
+  // -------------------------------------------------
     // Fetch Eureka registry (ALWAYS fresh)
     // -------------------------------------------------
     stage('Fetch Eureka Registry (XML)') {
@@ -115,82 +192,6 @@ Set-Content "services.txt"
         }
       }
     }
-
-    // -------------------------------------------------
-    // Resolve instanceId + port
-    // -------------------------------------------------
-    stage('Resolve Selected Instances') {
-      steps {
-        script {
-
-          writeFile file: 'resolve-targets.ps1', text: '''
-[xml]$x = Get-Content "apps.xml"
-
-$x.applications.application |
-Where-Object { $_.instance -ne $null } |
-ForEach-Object {
-  $app = $_.name
-  $_.instance | ForEach-Object {
-    "$app|$($_.instanceId)|$($_.port.InnerText)"
-  }
-} | Set-Content "all_targets.txt"
-'''
-          bat 'powershell -NoProfile -ExecutionPolicy Bypass -File resolve-targets.ps1'
-
-          def selected = []
-
-          readFile('all_targets.txt').readLines().each { line ->
-            def parts = line.split('\\|')
-            if (parts.size() == 3) {
-              def app = parts[0].toUpperCase()
-              def instanceId = parts[1]
-              def port = parts[2]
-
-              if (params["KILL_${app}"]) {
-                selected << "${app}|${instanceId}|${port}"
-              }
-            }
-          }
-
-          writeFile file: 'final_targets.txt', text: selected.join('\n')
-          env.HAS_TARGETS = selected ? 'yes' : ''
-        }
-      }
-    }
-
-    // -------------------------------------------------
-    // Kill OS processes (exit-safe)
-    // -------------------------------------------------
-    stage('Kill Processes') {
-      when { expression { env.HAS_TARGETS == 'yes' } }
-      steps {
-        bat '''
-          @echo off
-          for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
-            for /f "tokens=5" %%P in (
-              'netstat -ano ^| findstr LISTENING ^| findstr :%%C'
-            ) do taskkill /F /PID %%P >nul 2>&1 || echo PID %%P already stopped
-          )
-          exit /b 0
-        '''
-      }
-    }
-
-    // -------------------------------------------------
-    // Deregister using INSTANCE_ID
-    // -------------------------------------------------
-    stage('Deregister from Eureka') {
-      when { expression { env.HAS_TARGETS == 'yes' } }
-      steps {
-        bat '''
-          for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
-            curl -s -X DELETE ^
-              http://localhost:%EUREKA_PORT%/eureka/apps/%%A/%%B >nul 2>&1
-          )
-        '''
-      }
-    }
-  }
 
   post {
     always {
