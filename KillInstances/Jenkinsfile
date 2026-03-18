@@ -110,9 +110,8 @@ ForEach-Object {
         '''
       }
     }
-  }
 
-  // -------------------------------------------------
+    // -------------------------------------------------
     // Fetch Eureka registry (ALWAYS fresh)
     // -------------------------------------------------
     stage('Fetch Eureka Registry (XML)') {
@@ -192,6 +191,8 @@ Set-Content "services.txt"
         }
       }
     }
+  }
+
 
   post {
     always {
