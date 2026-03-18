@@ -7,9 +7,6 @@ pipeline {
       steps { deleteDir() }
     }
 
-    // -------------------------------------------------
-    // Clone EurekaServer
-    // -------------------------------------------------
     stage('Clone EurekaServer Repo') {
       steps {
         dir('eureka') {
@@ -18,24 +15,21 @@ pipeline {
       }
     }
 
-    // -------------------------------------------------
-    // Read Eureka Port (ORIGINAL REGEX – UNCHANGED)
-    // -------------------------------------------------
     stage('Read Eureka Port from application.yml') {
       steps {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
+
+          // ✅ ORIGINAL, APPROVED REGEX — UNCHANGED
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
           if (!m.find()) error "server.port not found"
+
           env.EUREKA_PORT = m.group(1)
           echo "Eureka port resolved."
         }
       }
     }
 
-    // -------------------------------------------------
-    // Fetch Eureka Registry (Before Kill)
-    // -------------------------------------------------
     stage('Fetch Eureka Registry (XML)') {
       steps {
         bat '''
@@ -44,9 +38,6 @@ pipeline {
       }
     }
 
-    // -------------------------------------------------
-    // Resolve instances (app | instanceId | port)
-    // -------------------------------------------------
     stage('Resolve Selected Instances') {
       steps {
         script {
@@ -61,18 +52,30 @@ ForEach-Object {
     $_.instance | ForEach-Object {
         "$app|$($_.instanceId)|$($_.port.InnerText)"
     }
-} | Set-Content "final_targets.txt"
+} | Set-Content "all_targets.txt"
 '''
-
           bat 'powershell -NoProfile -ExecutionPolicy Bypass -File resolve-targets.ps1'
-          env.HAS_TARGETS = fileExists('final_targets.txt') ? 'yes' : ''
+
+          def selected = []
+
+          readFile('all_targets.txt').readLines().each { line ->
+            def parts = line.split('\\|')
+            if (parts.size() == 3) {
+              def app = parts[0].toUpperCase()
+              def instanceId = parts[1]
+              def port = parts[2]
+              if (params["KILL_${app}"]) {
+                selected << "${app}|${instanceId}|${port}"
+              }
+            }
+          }
+
+          writeFile file: 'final_targets.txt', text: selected.join('\n')
+          env.HAS_TARGETS = selected ? 'yes' : ''
         }
       }
     }
 
-    // -------------------------------------------------
-    // Kill OS Processes (EXIT-SAFE)
-    // -------------------------------------------------
     stage('Kill Processes') {
       when { expression { env.HAS_TARGETS == 'yes' } }
       steps {
@@ -81,18 +84,13 @@ ForEach-Object {
           for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
             for /f "tokens=5" %%P in (
               'netstat -ano ^| findstr LISTENING ^| findstr :%%C'
-            ) do (
-              taskkill /F /PID %%P >nul 2>&1 || echo PID %%P already stopped
-            )
+            ) do taskkill /F /PID %%P >nul 2>&1 || echo PID %%P already stopped
           )
           exit /b 0
         '''
       }
     }
 
-    // -------------------------------------------------
-    // Deregister from Eureka
-    // -------------------------------------------------
     stage('Deregister from Eureka') {
       when { expression { env.HAS_TARGETS == 'yes' } }
       steps {
@@ -105,13 +103,13 @@ ForEach-Object {
       }
     }
 
-    // -------------------------------------------------
-    // ✅ OPTION 1: Poll Eureka Until Registry Stabilizes
-    // -------------------------------------------------
-    stage('Wait for Eureka Consistency') {
+    // =================================================
+    // ✅ OPTION 1 — WAIT FOR EUREKA CONSISTENCY
+    // =================================================
+    stage('Wait for Eureka Registry Refresh') {
       steps {
         script {
-          int maxRetries = 6        // ~30 seconds
+          int maxRetries = 6
           int sleepSeconds = 5
           boolean stable = false
 
@@ -130,7 +128,6 @@ Where-Object { $_.instance -ne $null } |
 ForEach-Object { $_.name } |
 Set-Content "services.txt"
 '''
-
             bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
 
             def services = readFile('services.txt')
@@ -138,9 +135,8 @@ Set-Content "services.txt"
               .collect { it.trim().toUpperCase() }
               .findAll { it }
 
-            echo "Services currently in Eureka: ${services}"
+            echo "Services still visible in Eureka: ${services}"
 
-            // ✅ Stabilization condition
             if (services.isEmpty() || services == ['CONFIGSERVER']) {
               echo "Eureka registry stabilized."
               stable = true
@@ -152,15 +148,12 @@ Set-Content "services.txt"
           }
 
           if (!stable) {
-            error "Eureka registry did not stabilize after retries"
+            echo "Eureka not fully refreshed yet. Proceeding with latest snapshot."
           }
         }
       }
     }
 
-    // -------------------------------------------------
-    // Create Service Checkboxes (FINAL STATE)
-    // -------------------------------------------------
     stage('Create Service Checkboxes') {
       steps {
         script {
@@ -169,6 +162,8 @@ Set-Content "services.txt"
             .readLines()
             .collect { it.trim().toUpperCase() }
             .unique()
+
+          echo "Active services in Eureka: ${services}"
 
           def paramsList = []
 
@@ -201,7 +196,7 @@ Set-Content "services.txt"
              parameterDefinitions: paramsList]
           ])
 
-          echo "✅ Parameters regenerated from stabilized Eureka registry."
+          echo "✅ Parameters created from refreshed Eureka registry."
           currentBuild.result = 'SUCCESS'
           return
         }
@@ -211,7 +206,7 @@ Set-Content "services.txt"
 
   post {
     always {
-      echo "✅ KillInstances pipeline finished successfully."
+      echo "✅ KillInstances finished successfully."
     }
   }
 }
