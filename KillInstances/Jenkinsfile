@@ -31,7 +31,7 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // ✅ Always fetch Eureka BEFORE using apps.xml
+    // ALWAYS fetch Eureka once per build
     // -------------------------------------------------
     stage('Fetch Eureka Registry (XML)') {
       steps {
@@ -43,7 +43,7 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // ✅ Create checkboxes (ONLY place)
+    // ✅ CREATE CHECKBOXES (SINGLE SOURCE OF TRUTH)
     // -------------------------------------------------
     stage('Create Service Checkboxes') {
       steps {
@@ -96,14 +96,14 @@ Set-Content "services.txt"
             )
           }
 
-          // ✅ Replace parameters for NEXT build
+          // ✅ Replace parameters (affects NEXT build)
           properties([
             [$class: 'ParametersDefinitionProperty',
              parameterDefinitions: paramsList]
           ])
 
-          // ✅ FIRST BUILD → stop here
-          if (currentBuild.rawBuild.getAction(hudson.model.ParametersAction) == null) {
+          // ✅ FIRST BUILD → exit cleanly
+          if (params.isEmpty()) {
             echo "ℹ First build initializes parameters. Re-run using 'Build with Parameters'."
             return
           }
@@ -112,14 +112,10 @@ Set-Content "services.txt"
     }
 
     // -------------------------------------------------
-    // ✅ Execution stages ONLY when parameters exist
+    // EXECUTION STAGES (SECOND BUILD ONWARD)
     // -------------------------------------------------
     stage('Resolve Selected Instances') {
-      when {
-        expression {
-          currentBuild.rawBuild.getAction(hudson.model.ParametersAction) != null
-        }
-      }
+      when { expression { !params.isEmpty() } }
       steps {
         script {
 
