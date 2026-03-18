@@ -22,12 +22,13 @@ pipeline {
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
           if (!m.find()) error "server.port not found"
           env.EUREKA_PORT = m.group(1)
-          echo "Eureka port resolved: ${env.EUREKA_PORT}"
         }
       }
     }
 
-    // ✅ Always fetch fresh Eureka registry
+    // -------------------------------------------------
+    // FETCH EUREKA (always)
+    // -------------------------------------------------
     stage('Fetch Eureka Registry (XML)') {
       steps {
         bat '''
@@ -37,8 +38,16 @@ pipeline {
       }
     }
 
-    // ✅ Create checkboxes (only place)
+    // -------------------------------------------------
+    // DISCOVERY MODE — ONLY CREATE CHECKBOXES
+    // -------------------------------------------------
     stage('Create Service Checkboxes') {
+      when {
+        expression {
+          // Discovery run if no KILL_* params yet
+          !params.keySet().any { it.startsWith('KILL_') }
+        }
+      }
       steps {
         script {
 
@@ -58,55 +67,35 @@ Set-Content "services.txt"
           def services = readFile('services.txt')
             .readLines()
             .collect { it.trim().toUpperCase() }
-            .findAll { it }
             .unique()
-
-          echo "Services at build start: ${services}"
 
           def paramsList = []
 
           if (services.isEmpty()) {
-            paramsList << booleanParam(
-              name: 'KILL_EUREKA',
-              defaultValue: false,
-              description: 'Kill Eureka Server'
-            )
+            paramsList << booleanParam(name: 'KILL_EUREKA', defaultValue: false)
           }
 
           if (services == ['CONFIGSERVER']) {
-            paramsList << booleanParam(
-              name: 'KILL_CONFIGSERVER',
-              defaultValue: false,
-              description: 'Kill Config Server'
-            )
+            paramsList << booleanParam(name: 'KILL_CONFIGSERVER', defaultValue: false)
           }
 
           services.findAll { it != 'CONFIGSERVER' }.each { svc ->
-            paramsList << booleanParam(
-              name: "KILL_${svc}",
-              defaultValue: false,
-              description: "Kill ${svc}"
-            )
+            paramsList << booleanParam(name: "KILL_${svc}", defaultValue: false)
           }
 
-          // ✅ Replace parameters for NEXT build
           properties([
             [$class: 'ParametersDefinitionProperty',
              parameterDefinitions: paramsList]
           ])
 
-          // ✅ Detect execution capability correctly
-          def hasKillParams = params.keySet().any { it.startsWith('KILL_') }
-
-          if (!hasKillParams) {
-            echo "ℹ First build initializes parameters. Re-run using 'Build with Parameters'."
-            return
-          }
+          echo "✅ Parameters generated. Re-run using 'Build with Parameters'."
         }
       }
     }
 
-    // ✅ Execution stages only when KILL_* params exist
+    // -------------------------------------------------
+    // EXECUTION MODE — NEVER TOUCH PARAMETERS
+    // -------------------------------------------------
     stage('Resolve Selected Instances') {
       when {
         expression {
@@ -154,7 +143,6 @@ ForEach-Object {
               'netstat -ano ^| findstr LISTENING ^| findstr :%%C'
             ) do taskkill /F /PID %%P >nul 2>&1
           )
-          exit /b 0
         '''
       }
     }
