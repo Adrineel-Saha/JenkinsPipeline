@@ -35,7 +35,18 @@ pipeline {
       }
     }
 
-
+    // -------------------------------------------------
+    // Fetch Eureka registry (ALWAYS fresh)
+    // -------------------------------------------------
+    stage('Fetch Eureka Registry (XML)') {
+      steps {
+        bat '''
+          del apps.xml >nul 2>&1
+          curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
+        '''
+      }
+    }
+    
     // -------------------------------------------------
     // Resolve instanceId + port
     // -------------------------------------------------
@@ -112,7 +123,7 @@ ForEach-Object {
     }
 
     // -------------------------------------------------
-    // Fetch Eureka registry (ALWAYS fresh)
+    // Fetch Eureka registry (After DEREGISTER)
     // -------------------------------------------------
     stage('Fetch Eureka Registry (XML)') {
       steps {
