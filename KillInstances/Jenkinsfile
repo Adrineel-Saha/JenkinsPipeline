@@ -42,18 +42,19 @@ pipeline {
       steps {
         script {
 
+          // ✅ Resolve ONLY instances that are UP
           writeFile file: 'resolve-targets.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 
 $x.applications.application |
-Where-Object { $_.instance -ne $null } |
 ForEach-Object {
-    $app = $_.name
-    $_.instance | ForEach-Object {
-        "$app|$($_.instanceId)|$($_.port.InnerText)"
+    $_.instance | Where-Object { $_.status -eq 'UP' } |
+    ForEach-Object {
+        "$($_.app)|$($_.instanceId)|$($_.port.InnerText)"
     }
 } | Set-Content "all_targets.txt"
 '''
+
           bat 'powershell -NoProfile -ExecutionPolicy Bypass -File resolve-targets.ps1'
 
           def selected = []
@@ -62,10 +63,8 @@ ForEach-Object {
             def parts = line.split('\\|')
             if (parts.size() == 3) {
               def app = parts[0].toUpperCase()
-              def instanceId = parts[1]
-              def port = parts[2]
               if (params["KILL_${app}"]) {
-                selected << "${app}|${instanceId}|${port}"
+                selected << line
               }
             }
           }
@@ -104,14 +103,13 @@ ForEach-Object {
     }
 
     // =================================================
-    // ✅ OPTION 1 — WAIT FOR EUREKA CONSISTENCY
+    // ✅ WAIT FOR EUREKA REGISTRY TO REFLECT REAL STATE
     // =================================================
     stage('Wait for Eureka Registry Refresh') {
       steps {
         script {
           int maxRetries = 6
           int sleepSeconds = 5
-          boolean stable = false
 
           for (int i = 1; i <= maxRetries; i++) {
             echo "Polling Eureka registry (attempt ${i}/${maxRetries})"
@@ -120,14 +118,19 @@ ForEach-Object {
               curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
             '''
 
+            // ✅ Extract ONLY services with UP instances
             writeFile file: 'extract-services.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 
 $x.applications.application |
-Where-Object { $_.instance -ne $null } |
-ForEach-Object { $_.name } |
-Set-Content "services.txt"
+ForEach-Object {
+    $up = $_.instance | Where-Object { $_.status -eq 'UP' }
+    if ($up) {
+        $_.name
+    }
+} | Set-Content "services.txt"
 '''
+
             bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
 
             def services = readFile('services.txt')
@@ -135,20 +138,15 @@ Set-Content "services.txt"
               .collect { it.trim().toUpperCase() }
               .findAll { it }
 
-            echo "Services still visible in Eureka: ${services}"
+            echo "UP services in Eureka: ${services}"
 
             if (services.isEmpty() || services == ['CONFIGSERVER']) {
               echo "Eureka registry stabilized."
-              stable = true
               break
             }
 
-            echo "Registry not yet updated. Waiting ${sleepSeconds}s..."
+            echo "Registry not yet stable. Waiting ${sleepSeconds}s..."
             sleep sleepSeconds
-          }
-
-          if (!stable) {
-            echo "Eureka not fully refreshed yet. Proceeding with latest snapshot."
           }
         }
       }
@@ -163,10 +161,11 @@ Set-Content "services.txt"
             .collect { it.trim().toUpperCase() }
             .unique()
 
-          echo "Active services in Eureka: ${services}"
+          echo "FINAL active services: ${services}"
 
           def paramsList = []
 
+          // ✅ CORRECT SHOW / HIDE LOGIC
           if (services.isEmpty()) {
             paramsList << booleanParam(
               name: 'KILL_EUREKA',
@@ -196,7 +195,7 @@ Set-Content "services.txt"
              parameterDefinitions: paramsList]
           ])
 
-          echo "✅ Parameters created from refreshed Eureka registry."
+          echo "✅ Parameters generated correctly."
           currentBuild.result = 'SUCCESS'
           return
         }
