@@ -51,13 +51,12 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // ✅ Create checkboxes (PROPER SHOW / HIDE)
+    // ✅ Create checkboxes (PRE-KILL, current state)
     // -------------------------------------------------
     stage('Create Service Checkboxes') {
       steps {
         script {
 
-          // ✅ Extract ONLY services with ACTIVE instances
           writeFile file: 'extract-services.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 
@@ -74,11 +73,10 @@ Set-Content "services.txt"
             .findAll { it }
             .unique()
 
-          echo "Active services in Eureka: ${services}"
+          echo "Active services BEFORE kill: ${services}"
 
           def paramsList = []
 
-          // ✅ Show KILL_EUREKA only when NOTHING exists
           if (services.isEmpty()) {
             paramsList << booleanParam(
               name: 'KILL_EUREKA',
@@ -87,7 +85,6 @@ Set-Content "services.txt"
             )
           }
 
-          // ✅ Show KILL_CONFIGSERVER only when it is the ONLY service
           if (services == ['CONFIGSERVER']) {
             paramsList << booleanParam(
               name: 'KILL_CONFIGSERVER',
@@ -96,7 +93,6 @@ Set-Content "services.txt"
             )
           }
 
-          // ✅ Show ONLY currently active app services
           services.findAll { it != 'CONFIGSERVER' }.each { svc ->
             paramsList << booleanParam(
               name: "KILL_${svc}",
@@ -105,13 +101,12 @@ Set-Content "services.txt"
             )
           }
 
-          // ✅ ✅ ✅ PROPER PARAMETER REPLACEMENT (NO MERGE)
+          // ✅ Replace parameters (no merge)
           properties([
             [$class: 'ParametersDefinitionProperty',
              parameterDefinitions: paramsList]
           ])
 
-          echo "✅ Parameters replaced correctly. Re-run with 'Build with Parameters'."
           currentBuild.result = 'SUCCESS'
           return
         }
@@ -160,7 +155,7 @@ ForEach-Object {
     }
 
     // -------------------------------------------------
-    // ✅ Kill OS processes (exit-safe)
+    // Kill OS processes
     // -------------------------------------------------
     stage('Kill Processes') {
       when { expression { env.HAS_TARGETS == 'yes' } }
@@ -168,7 +163,6 @@ ForEach-Object {
         bat '''
           @echo off
           for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
-            echo Killing %%A on port %%C
             for /f "tokens=5" %%P in (
               'netstat -ano ^| findstr LISTENING ^| findstr :%%C'
             ) do taskkill /F /PID %%P >nul 2>&1 || echo PID %%P already stopped
@@ -179,18 +173,84 @@ ForEach-Object {
     }
 
     // -------------------------------------------------
-    // ✅ Deregister from Eureka using INSTANCE_ID
+    // Deregister using INSTANCE_ID
     // -------------------------------------------------
     stage('Deregister from Eureka') {
       when { expression { env.HAS_TARGETS == 'yes' } }
       steps {
         bat '''
           for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
-            echo Deregistering %%A / %%B
             curl -s -X DELETE ^
               http://localhost:%EUREKA_PORT%/eureka/apps/%%A/%%B >nul 2>&1
           )
         '''
+      }
+    }
+
+    // -------------------------------------------------
+    // ✅ ✅ REFRESH CHECKBOXES FOR NEXT BUILD (THE FIX)
+    // -------------------------------------------------
+    stage('Refresh Checkboxes For Next Build') {
+      steps {
+        script {
+
+          // Re-fetch Eureka AFTER deregister
+          bat '''
+            curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
+          '''
+
+          writeFile file: 'extract-services.ps1', text: '''
+[xml]$x = Get-Content "apps.xml"
+
+$x.applications.application |
+Where-Object { $_.instance -ne $null } |
+ForEach-Object { $_.name } |
+Set-Content "services.txt"
+'''
+          bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
+
+          def services = readFile('services.txt')
+            .readLines()
+            .collect { it.trim().toUpperCase() }
+            .findAll { it }
+            .unique()
+
+          echo "Active services AFTER deregister: ${services}"
+
+          def paramsList = []
+
+          if (services.isEmpty()) {
+            paramsList << booleanParam(
+              name: 'KILL_EUREKA',
+              defaultValue: false,
+              description: 'Kill Eureka Server'
+            )
+          }
+
+          if (services == ['CONFIGSERVER']) {
+            paramsList << booleanParam(
+              name: 'KILL_CONFIGSERVER',
+              defaultValue: false,
+              description: 'Kill Config Server'
+            )
+          }
+
+          services.findAll { it != 'CONFIGSERVER' }.each { svc ->
+            paramsList << booleanParam(
+              name: "KILL_${svc}",
+              defaultValue: false,
+              description: "Kill ${svc}"
+            )
+          }
+
+          // ✅ Replace parameters AGAIN for NEXT build
+          properties([
+            [$class: 'ParametersDefinitionProperty',
+             parameterDefinitions: paramsList]
+          ])
+
+          echo "✅ Checkboxes refreshed for next build."
+        }
       }
     }
   }
