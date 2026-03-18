@@ -51,23 +51,21 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // ✅ Create checkboxes using CORRECT SHOW / HIDE logic
+    // ✅ Create checkboxes (PROPER SHOW / HIDE)
     // -------------------------------------------------
     stage('Create Service Checkboxes') {
       steps {
         script {
 
-          // ✅ Only services with ACTIVE INSTANCES
+          // ✅ Extract ONLY services with ACTIVE instances
           writeFile file: 'extract-services.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 
 $x.applications.application |
 Where-Object { $_.instance -ne $null } |
-ForEach-Object {
-    $_.name
-} | Set-Content "services.txt"
+ForEach-Object { $_.name } |
+Set-Content "services.txt"
 '''
-
           bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
 
           def services = readFile('services.txt')
@@ -80,7 +78,7 @@ ForEach-Object {
 
           def paramsList = []
 
-          // ✅ Show KILL_EUREKA only when NO services exist
+          // ✅ Show KILL_EUREKA only when NOTHING exists
           if (services.isEmpty()) {
             paramsList << booleanParam(
               name: 'KILL_EUREKA',
@@ -98,7 +96,7 @@ ForEach-Object {
             )
           }
 
-          // ✅ Show other services ONLY if they exist
+          // ✅ Show ONLY currently active app services
           services.findAll { it != 'CONFIGSERVER' }.each { svc ->
             paramsList << booleanParam(
               name: "KILL_${svc}",
@@ -107,10 +105,13 @@ ForEach-Object {
             )
           }
 
-          properties([])
-          properties([parameters(paramsList)])
+          // ✅ ✅ ✅ PROPER PARAMETER REPLACEMENT (NO MERGE)
+          properties([
+            [$class: 'ParametersDefinitionProperty',
+             parameterDefinitions: paramsList]
+          ])
 
-          echo "✅ Checkboxes created correctly. Re-run with 'Build with Parameters'."
+          echo "✅ Parameters replaced correctly. Re-run with 'Build with Parameters'."
           currentBuild.result = 'SUCCESS'
           return
         }
@@ -118,7 +119,7 @@ ForEach-Object {
     }
 
     // -------------------------------------------------
-    // Resolve instanceId + port for selected services
+    // Resolve instanceId + port
     // -------------------------------------------------
     stage('Resolve Selected Instances') {
       steps {
@@ -136,7 +137,6 @@ ForEach-Object {
     }
 } | Set-Content "all_targets.txt"
 '''
-
           bat 'powershell -NoProfile -ExecutionPolicy Bypass -File resolve-targets.ps1'
 
           def selected = []
@@ -147,7 +147,6 @@ ForEach-Object {
               def app = parts[0].toUpperCase()
               def instanceId = parts[1]
               def port = parts[2]
-
               if (params["KILL_${app}"]) {
                 selected << "${app}|${instanceId}|${port}"
               }
@@ -161,31 +160,26 @@ ForEach-Object {
     }
 
     // -------------------------------------------------
-    // ✅ Kill OS processes by PORT (exit-safe)
+    // ✅ Kill OS processes (exit-safe)
     // -------------------------------------------------
     stage('Kill Processes') {
       when { expression { env.HAS_TARGETS == 'yes' } }
       steps {
         bat '''
           @echo off
-
           for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
             echo Killing %%A on port %%C
-
             for /f "tokens=5" %%P in (
               'netstat -ano ^| findstr LISTENING ^| findstr :%%C'
-            ) do (
-              taskkill /F /PID %%P >nul 2>&1 || echo PID %%P already stopped
-            )
+            ) do taskkill /F /PID %%P >nul 2>&1 || echo PID %%P already stopped
           )
-
           exit /b 0
         '''
       }
     }
 
     // -------------------------------------------------
-    // ✅ Deregister instances from Eureka using INSTANCE_ID
+    // ✅ Deregister from Eureka using INSTANCE_ID
     // -------------------------------------------------
     stage('Deregister from Eureka') {
       when { expression { env.HAS_TARGETS == 'yes' } }
