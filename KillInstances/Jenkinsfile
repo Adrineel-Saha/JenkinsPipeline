@@ -7,6 +7,9 @@ pipeline {
       steps { deleteDir() }
     }
 
+    // -------------------------------------------------
+    // Clone EurekaServer
+    // -------------------------------------------------
     stage('Clone EurekaServer Repo') {
       steps {
         dir('eureka') {
@@ -15,6 +18,9 @@ pipeline {
       }
     }
 
+    // -------------------------------------------------
+    // Read Eureka server.port (DO NOT CHANGE REGEX)
+    // -------------------------------------------------
     stage('Read Eureka Port from application.yml') {
       steps {
         script {
@@ -28,7 +34,7 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // Fetch Eureka BEFORE creating parameters
+    // ALWAYS fetch Eureka ONCE per build (fresh)
     // -------------------------------------------------
     stage('Fetch Eureka Registry (XML)') {
       steps {
@@ -40,12 +46,13 @@ pipeline {
     }
 
     // -------------------------------------------------
-    // Create dynamic checkboxes (ONLY place)
+    // ✅ CREATE CHECKBOXES (SINGLE SOURCE OF TRUTH)
     // -------------------------------------------------
     stage('Create Service Checkboxes') {
       steps {
         script {
 
+          // ✅ Filter ONLY instances that are really UP
           writeFile file: 'extract-services.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 
@@ -57,49 +64,67 @@ Where-Object {
 ForEach-Object { $_.name } |
 Set-Content "services.txt"
 '''
+
           bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
 
           def services = readFile('services.txt')
             .readLines()
             .collect { it.trim().toUpperCase() }
+            .findAll { it }
             .unique()
 
           echo "Services at build start: ${services}"
 
           def paramsList = []
 
+          // Infrastructure rules
           if (services.isEmpty()) {
-            paramsList << booleanParam(name: 'KILL_EUREKA', defaultValue: false)
+            paramsList << booleanParam(
+              name: 'KILL_EUREKA',
+              defaultValue: false,
+              description: 'Kill Eureka Server'
+            )
           }
 
           if (services == ['CONFIGSERVER']) {
-            paramsList << booleanParam(name: 'KILL_CONFIGSERVER', defaultValue: false)
+            paramsList << booleanParam(
+              name: 'KILL_CONFIGSERVER',
+              defaultValue: false,
+              description: 'Kill Config Server'
+            )
           }
 
+          // Application services
           services.findAll { it != 'CONFIGSERVER' }.each { svc ->
-            paramsList << booleanParam(name: "KILL_${svc}", defaultValue: false)
+            paramsList << booleanParam(
+              name: "KILL_${svc}",
+              defaultValue: false,
+              description: "Kill ${svc}"
+            )
           }
 
-          // ✅ Replace parameters for NEXT build
+          // ✅ Replace parameters (affects NEXT build)
           properties([
             [$class: 'ParametersDefinitionProperty',
              parameterDefinitions: paramsList]
           ])
 
-          echo "✅ Parameters initialized. Re-run using 'Build with Parameters'."
-          return
+          // ✅ First build = setup only
+          if (!currentBuild.rawBuild.getAction(hudson.model.ParametersAction)) {
+            echo "ℹ First build initializes parameters. Re-run using 'Build with Parameters'."
+            return
+          }
         }
       }
     }
 
     // -------------------------------------------------
-    // Execution stages ONLY if parameters exist
+    // Resolve instanceId + port (EXECUTION BUILDS ONLY)
     // -------------------------------------------------
     stage('Resolve Selected Instances') {
       when {
         expression {
-          // parameters exist only from second build
-          params?.size() > 0
+          currentBuild.rawBuild.getAction(hudson.model.ParametersAction) != null
         }
       }
       steps {
@@ -117,6 +142,7 @@ ForEach-Object {
   }
 } | Set-Content "all_targets.txt"
 '''
+
           bat 'powershell -NoProfile -ExecutionPolicy Bypass -File resolve-targets.ps1'
 
           def selected = []
@@ -134,6 +160,9 @@ ForEach-Object {
       }
     }
 
+    // -------------------------------------------------
+    // Kill OS processes
+    // -------------------------------------------------
     stage('Kill Processes') {
       when { expression { env.HAS_TARGETS == 'yes' } }
       steps {
@@ -148,6 +177,9 @@ ForEach-Object {
       }
     }
 
+    // -------------------------------------------------
+    // Deregister from Eureka using INSTANCE_ID
+    // -------------------------------------------------
     stage('Deregister from Eureka') {
       when { expression { env.HAS_TARGETS == 'yes' } }
       steps {
