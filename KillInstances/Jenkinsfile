@@ -2,8 +2,7 @@ pipeline {
   agent any
 
   environment {
-    // Freeze user intent for this build
-    KILL_EUREKA_SELECTED = 'false'
+    KILL_EUREKA_SELECTED  = 'false'
     HAS_SERVICE_TARGETS  = 'false'
   }
 
@@ -36,8 +35,11 @@ pipeline {
       steps {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
+
+          // ✅ ORIGINAL REGEX — UNCHANGED
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
           if (!m.find()) error "server.port not found"
+
           env.EUREKA_PORT = m.group(1)
         }
       }
@@ -84,7 +86,7 @@ ForEach-Object {
       }
     }
 
-    // ✅ EXPLICIT EUREKA KILL
+    // ✅ Explicit Eureka Kill (job-level operation)
     stage('Kill Eureka Server') {
       when { expression { env.KILL_EUREKA_SELECTED == 'true' } }
       steps {
@@ -146,10 +148,14 @@ ForEach-Object {
             services = readFile('services.txt')
               .readLines()
               .collect { it.trim().toUpperCase() }
+              .findAll { it }
           }
+
+          echo "FINAL active services: ${services}"
 
           def paramsList = []
 
+          // ✅ CASE 1: No services → only KILL_EUREKA
           if (services.isEmpty()) {
             paramsList << booleanParam(
               name: 'KILL_EUREKA',
@@ -158,12 +164,24 @@ ForEach-Object {
             )
           }
 
-          services.each { svc ->
+          // ✅ CASE 2: Only CONFIGSERVER → only KILL_CONFIGSERVER
+          else if (services == ['CONFIGSERVER']) {
             paramsList << booleanParam(
-              name: "KILL_${svc}",
+              name: 'KILL_CONFIGSERVER',
               defaultValue: false,
-              description: "Kill ${svc}"
+              description: 'Kill Config Server'
             )
+          }
+
+          // ✅ CASE 3: Other services present → exclude CONFIGSERVER
+          else {
+            services.findAll { it != 'CONFIGSERVER' }.each { svc ->
+              paramsList << booleanParam(
+                name: "KILL_${svc}",
+                defaultValue: false,
+                description: "Kill ${svc}"
+              )
+            }
           }
 
           properties([
@@ -174,7 +192,6 @@ ForEach-Object {
       }
     }
 
-    // ✅ CLEAR PARAMETERS AFTER EUREKA KILL
     stage('Clear Parameters After Eureka Kill') {
       when { expression { env.KILL_EUREKA_SELECTED == 'true' } }
       steps {
