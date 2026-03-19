@@ -42,13 +42,13 @@ pipeline {
       steps {
         script {
 
+          // ✅ Resolve only instances that are actually present (instanceId-based)
           writeFile file: 'resolve-targets.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 
 $x.applications.application |
 ForEach-Object {
-    $_.instance | Where-Object { $_.status -eq 'UP' } |
-    ForEach-Object {
+    $_.instance | ForEach-Object {
         "$($_.app)|$($_.instanceId)|$($_.port.InnerText)"
     }
 } | Set-Content "all_targets.txt"
@@ -58,12 +58,14 @@ ForEach-Object {
 
           def selected = []
 
-          readFile('all_targets.txt').readLines().each { line ->
-            def parts = line.split('\\|')
-            if (parts.size() == 3) {
-              def app = parts[0].toUpperCase()
-              if (params["KILL_${app}"]) {
-                selected << line
+          if (params) {
+            readFile('all_targets.txt').readLines().each { line ->
+              def parts = line.split('\\|')
+              if (parts.size() == 3) {
+                def app = parts[0].toUpperCase()
+                if (params["KILL_${app}"]) {
+                  selected << line
+                }
               }
             }
           }
@@ -102,13 +104,14 @@ ForEach-Object {
     }
 
     // =================================================
-    // ✅ FIXED WAIT LOGIC — CONFIGSERVER NO LONGER STABLE
+    // ✅ WAIT FOR EUREKA REGISTRY TO CONVERGE (INSTANCE-ID BASED)
     // =================================================
     stage('Wait for Eureka Registry Refresh') {
       steps {
         script {
-          int maxRetries = 6
+          int maxRetries = 12
           int sleepSeconds = 5
+          boolean stable = false
 
           for (int i = 1; i <= maxRetries; i++) {
             echo "Polling Eureka registry (attempt ${i}/${maxRetries})"
@@ -117,35 +120,38 @@ ForEach-Object {
               curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
             '''
 
-            writeFile file: 'extract-services.ps1', text: '''
+            // ✅ Extract instanceIds (ONLY reliable signal)
+            writeFile file: 'extract-instance-ids.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 
 $x.applications.application |
 ForEach-Object {
-    $up = $_.instance | Where-Object { $_.status -eq 'UP' }
-    if ($up) {
-        $_.name
+    $_.instance | ForEach-Object {
+        $_.instanceId
     }
-} | Set-Content "services.txt"
+} | Set-Content "instance_ids.txt"
 '''
 
-            bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
+            bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-instance-ids.ps1'
 
-            def services = readFile('services.txt')
+            def ids = readFile('instance_ids.txt')
               .readLines()
-              .collect { it.trim().toUpperCase() }
               .findAll { it }
 
-            echo "UP services in Eureka: ${services}"
+            echo "Instance IDs still present: ${ids}"
 
-            // ✅ ONLY EMPTY REGISTRY IS STABLE
-            if (services.isEmpty()) {
+            if (ids.isEmpty()) {
               echo "Eureka registry stabilized."
+              stable = true
               break
             }
 
             echo "Registry not yet stable. Waiting ${sleepSeconds}s..."
             sleep sleepSeconds
+          }
+
+          if (!stable) {
+            echo "Eureka still has cached instances. Continuing anyway."
           }
         }
       }
@@ -155,12 +161,34 @@ ForEach-Object {
       steps {
         script {
 
+          // ✅ Re-extract ACTIVE services based on instanceIds
+          writeFile file: 'extract-services.ps1', text: '''
+[xml]$x = Get-Content "apps.xml"
+
+$x.applications.application |
+ForEach-Object {
+    $_.instance | ForEach-Object {
+        $_.app
+    }
+} | Sort-Object -Unique | Set-Content "services.txt"
+'''
+
+          bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
+
           def services = readFile('services.txt')
             .readLines()
             .collect { it.trim().toUpperCase() }
-            .unique()
+            .findAll { it }
 
           echo "FINAL active services: ${services}"
+
+          // ✅ If Eureka was killed → remove ALL parameters
+          if (params?.KILL_EUREKA) {
+            echo "Eureka Server killed. Clearing all parameters."
+            properties([])
+            currentBuild.result = 'SUCCESS'
+            return
+          }
 
           def paramsList = []
 
