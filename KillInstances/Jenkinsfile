@@ -42,7 +42,6 @@ pipeline {
       steps {
         script {
 
-          // ✅ Resolve ONLY instances that are UP
           writeFile file: 'resolve-targets.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 
@@ -103,7 +102,7 @@ ForEach-Object {
     }
 
     // =================================================
-    // ✅ WAIT FOR EUREKA REGISTRY TO REFLECT REAL STATE
+    // ✅ FIXED WAIT LOGIC — CONFIGSERVER NO LONGER STABLE
     // =================================================
     stage('Wait for Eureka Registry Refresh') {
       steps {
@@ -118,7 +117,6 @@ ForEach-Object {
               curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
             '''
 
-            // ✅ Extract ONLY services with UP instances
             writeFile file: 'extract-services.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 
@@ -140,7 +138,8 @@ ForEach-Object {
 
             echo "UP services in Eureka: ${services}"
 
-            if (services.isEmpty() || services == ['CONFIGSERVER']) {
+            // ✅ ONLY EMPTY REGISTRY IS STABLE
+            if (services.isEmpty()) {
               echo "Eureka registry stabilized."
               break
             }
@@ -165,7 +164,6 @@ ForEach-Object {
 
           def paramsList = []
 
-          // ✅ CORRECT SHOW / HIDE LOGIC
           if (services.isEmpty()) {
             paramsList << booleanParam(
               name: 'KILL_EUREKA',
