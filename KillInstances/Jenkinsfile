@@ -34,19 +34,15 @@ pipeline {
     
           def yml = readFile(ymlPath)
     
-          /*
-           ✅ FIXES:
-           - Allows leading whitespace
-           - Handles UTF‑8 BOM if present
-           - Still enforces digits‑only port
-           */
           def m = (yml =~ /(?m)^[\s\uFEFF]*server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)/)
     
-          if (!m.find() || !m.group(1)) {
+          if (!m || m.size() == 0) {
             error "❌ server.port not found or not numeric in ${ymlPath}"
           }
     
-          env.EUREKA_PORT = m.group(1)
+          // ✅ GROOVY-CORRECT extraction
+          env.EUREKA_PORT = m[0][1]
+    
           echo "✅ Eureka Port = ${env.EUREKA_PORT}"
         }
       }
