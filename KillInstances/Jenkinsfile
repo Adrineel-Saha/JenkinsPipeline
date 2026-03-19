@@ -2,7 +2,7 @@ pipeline {
   agent any
 
   environment {
-    // ✅ Freeze Eureka kill intent for the whole build
+    // ✅ Freeze Eureka kill intent for entire build
     KILL_EUREKA_SELECTED = 'false'
   }
 
@@ -60,7 +60,6 @@ pipeline {
 
           writeFile file: 'resolve-targets.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
-
 $x.applications.application |
 ForEach-Object {
     $_.instance | ForEach-Object {
@@ -85,9 +84,12 @@ ForEach-Object {
           }
 
           writeFile file: 'final_targets.txt', text: selected.join('\n')
-          env.HAS_TARGETS = selected ? 'yes' : ''
 
-          if (!env.HAS_TARGETS) {
+          // ✅ FIX: KILL_EUREKA is also a valid execution target
+          if (selected || env.KILL_EUREKA_SELECTED == 'true') {
+            env.HAS_TARGETS = 'yes'
+          } else {
+            env.HAS_TARGETS = ''
             echo "Discovery build detected (no services selected)."
           }
         }
@@ -110,7 +112,11 @@ ForEach-Object {
     }
 
     stage('Deregister from Eureka') {
-      when { expression { env.HAS_TARGETS == 'yes' } }
+      when {
+        expression {
+          env.HAS_TARGETS == 'yes' && env.KILL_EUREKA_SELECTED != 'true'
+        }
+      }
       steps {
         bat '''
           for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
@@ -170,7 +176,7 @@ ForEach-Object {
 
           echo "FINAL active services: ${services}"
 
-          // ✅ USE FROZEN VALUE — NOT params
+          // ✅ After KILL_EUREKA → remove ALL parameters
           if (env.KILL_EUREKA_SELECTED == 'true') {
             echo "Eureka Server killed. Clearing parameters."
             properties([])
