@@ -20,7 +20,7 @@ pipeline {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
 
-          // ✅ ORIGINAL, APPROVED REGEX — UNCHANGED
+          // ✅ ORIGINAL REGEX (UNCHANGED)
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
           if (!m.find()) error "server.port not found"
 
@@ -32,9 +32,7 @@ pipeline {
 
     stage('Fetch Eureka Registry (XML)') {
       steps {
-        bat '''
-          curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
-        '''
+        bat 'curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml'
       }
     }
 
@@ -42,7 +40,6 @@ pipeline {
       steps {
         script {
 
-          // ✅ Resolve only instances that are actually present (instanceId-based)
           writeFile file: 'resolve-targets.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 
@@ -53,7 +50,6 @@ ForEach-Object {
     }
 } | Set-Content "all_targets.txt"
 '''
-
           bat 'powershell -NoProfile -ExecutionPolicy Bypass -File resolve-targets.ps1'
 
           def selected = []
@@ -103,55 +99,36 @@ ForEach-Object {
       }
     }
 
-    // =================================================
-    // ✅ WAIT FOR EUREKA REGISTRY TO CONVERGE (INSTANCE-ID BASED)
-    // =================================================
     stage('Wait for Eureka Registry Refresh') {
       steps {
         script {
           int maxRetries = 12
           int sleepSeconds = 5
-          boolean stable = false
 
           for (int i = 1; i <= maxRetries; i++) {
             echo "Polling Eureka registry (attempt ${i}/${maxRetries})"
 
-            bat '''
-              curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
-            '''
+            bat 'curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml'
 
-            // ✅ Extract instanceIds (ONLY reliable signal)
             writeFile file: 'extract-instance-ids.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
-
 $x.applications.application |
 ForEach-Object {
-    $_.instance | ForEach-Object {
-        $_.instanceId
-    }
+    $_.instance | ForEach-Object { $_.instanceId }
 } | Set-Content "instance_ids.txt"
 '''
-
             bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-instance-ids.ps1'
 
-            def ids = readFile('instance_ids.txt')
-              .readLines()
-              .findAll { it }
+            def ids = readFile('instance_ids.txt').readLines().findAll { it }
 
             echo "Instance IDs still present: ${ids}"
 
             if (ids.isEmpty()) {
               echo "Eureka registry stabilized."
-              stable = true
               break
             }
 
-            echo "Registry not yet stable. Waiting ${sleepSeconds}s..."
             sleep sleepSeconds
-          }
-
-          if (!stable) {
-            echo "Eureka still has cached instances. Continuing anyway."
           }
         }
       }
@@ -161,30 +138,29 @@ ForEach-Object {
       steps {
         script {
 
-          // ✅ Re-extract ACTIVE services based on instanceIds
+          // ✅ ALWAYS regenerate services.txt here
           writeFile file: 'extract-services.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
-
 $x.applications.application |
 ForEach-Object {
-    $_.instance | ForEach-Object {
-        $_.app
-    }
+    $_.instance | ForEach-Object { $_.app }
 } | Sort-Object -Unique | Set-Content "services.txt"
 '''
-
           bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
 
-          def services = readFile('services.txt')
-            .readLines()
-            .collect { it.trim().toUpperCase() }
-            .findAll { it }
+          def services = []
+          if (fileExists('services.txt')) {
+            services = readFile('services.txt')
+              .readLines()
+              .collect { it.trim().toUpperCase() }
+              .findAll { it }
+          }
 
           echo "FINAL active services: ${services}"
 
-          // ✅ If Eureka was killed → remove ALL parameters
+          // ✅ If Eureka was killed → clear all parameters
           if (params?.KILL_EUREKA) {
-            echo "Eureka Server killed. Clearing all parameters."
+            echo "Eureka Server killed. Clearing parameters."
             properties([])
             currentBuild.result = 'SUCCESS'
             return
@@ -221,7 +197,6 @@ ForEach-Object {
              parameterDefinitions: paramsList]
           ])
 
-          echo "✅ Parameters generated correctly."
           currentBuild.result = 'SUCCESS'
           return
         }
