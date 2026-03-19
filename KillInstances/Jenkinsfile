@@ -1,28 +1,13 @@
-/* ============================================================
-   Groovy-scoped computed values
-   ============================================================ */
 def EUREKA_PORT = null
 
 pipeline {
   agent any
 
-  environment {
-    DISCOVERY_ONLY      = 'true'
-    HAS_SERVICE_TARGETS = 'false'
-  }
-
   stages {
 
     /* ============================================================
-       CLEAN + CLONE
+       CLONE EUREKA SERVER REPO
        ============================================================ */
-
-    stage('Clean Workspace') {
-      steps {
-        deleteDir()
-      }
-    }
-
     stage('Clone EurekaServer Repo') {
       steps {
         git url: 'https://github.com/Adrineel-Saha/EurekaServer.git', branch: 'main'
@@ -32,7 +17,6 @@ pipeline {
     /* ============================================================
        READ EUREKA PORT
        ============================================================ */
-
     stage('Read Eureka Port') {
       steps {
         script {
@@ -41,11 +25,11 @@ pipeline {
             .find { it.trim().startsWith('port:') }
 
           if (!line) {
-            error "server.port not found in application.yml"
+            error 'server.port not found in application.yml'
           }
 
           EUREKA_PORT = line.split(':')[1].trim()
-          echo "✅ Eureka Port resolved = ${EUREKA_PORT}"
+          echo "✅ Eureka Port = ${EUREKA_PORT}"
         }
       }
     }
@@ -53,7 +37,6 @@ pipeline {
     /* ============================================================
        FETCH EUREKA REGISTRY
        ============================================================ */
-
     stage('Fetch Eureka Registry') {
       steps {
         withEnv(["EUREKA_PORT=${EUREKA_PORT}"]) {
@@ -65,7 +48,6 @@ pipeline {
     /* ============================================================
        EXTRACT REGISTERED SERVICES
        ============================================================ */
-
     stage('Extract Registered Services') {
       steps {
         writeFile file: 'extract-services.ps1', text: '''
@@ -78,18 +60,90 @@ Set-Content "services.txt"
         bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
 
         script {
-          if (fileExists('services.txt') && readFile('services.txt').trim()) {
-            env.HAS_SERVICE_TARGETS = 'true'
+          echo "✅ Services from Eureka:"
+          if (fileExists('services.txt')) {
+            echo readFile('services.txt')
+          } else {
+            echo "(none)"
           }
         }
       }
     }
 
     /* ============================================================
-       CREATE / UPDATE KILL CHECKBOXES (ACTIVE CHOICES)
+       RESOLVE SELECTED TARGET
        ============================================================ */
+    stage('Resolve Selected Target') {
+      steps {
+        script {
+          echo "KILL_EUREKA       = ${params.KILL_EUREKA}"
+          echo "KILL_CONFIGSERVER = ${params.KILL_CONFIGSERVER}"
 
-    stage('Create / Update Kill Checkboxes') {
+          if (params.KILL_EUREKA?.contains('KILL_EUREKA')) {
+            echo "➡ Target resolved: EUREKA"
+          } else if (params.KILL_CONFIGSERVER?.contains('KILL_CONFIGSERVER')) {
+            echo "➡ Target resolved: CONFIGSERVER"
+          } else {
+            echo "➡ No kill target selected"
+          }
+        }
+      }
+    }
+
+    /* ============================================================
+       KILL PROCESS
+       ============================================================ */
+    stage('Kill Process') {
+      when {
+        expression {
+          params.KILL_EUREKA?.contains('KILL_EUREKA') ||
+          params.KILL_CONFIGSERVER?.contains('KILL_CONFIGSERVER')
+        }
+      }
+      steps {
+        script {
+          if (params.KILL_EUREKA?.contains('KILL_EUREKA')) {
+            withEnv(["EUREKA_PORT=${EUREKA_PORT}"]) {
+              bat '''
+                echo Killing Eureka on port %EUREKA_PORT%
+                for /f "tokens=5" %%P in (
+                  'netstat -ano ^| findstr LISTENING ^| findstr :%EUREKA_PORT%'
+                ) do taskkill /F /PID %%P >nul 2>&1
+              '''
+            }
+          }
+
+          if (params.KILL_CONFIGSERVER?.contains('KILL_CONFIGSERVER')) {
+            echo "✅ Config Server kill logic goes here"
+          }
+        }
+      }
+    }
+
+    /* ============================================================
+       DEREGISTER FROM EUREKA
+       ============================================================ */
+    stage('Deregister') {
+      when {
+        expression {
+          params.KILL_CONFIGSERVER?.contains('KILL_CONFIGSERVER')
+        }
+      }
+      steps {
+        withEnv(["EUREKA_PORT=${EUREKA_PORT}"]) {
+          bat '''
+            echo Deregistering CONFIGSERVER from Eureka
+            curl -s -X DELETE ^
+              http://localhost:%EUREKA_PORT%/eureka/apps/CONFIGSERVER >nul 2>&1
+          '''
+        }
+      }
+    }
+
+    /* ============================================================
+       UPDATE CHECKBOXES (ACTIVE CHOICES)
+       ============================================================ */
+    stage('Update Kill Checkboxes') {
       steps {
         script {
           properties([
@@ -99,18 +153,18 @@ Set-Content "services.txt"
               [
                 $class: 'ChoiceParameter',
                 name: 'KILL_EUREKA',
-                description: 'Kill Eureka Server',
+                description: 'Kill Eureka Server (enabled only when no services)',
                 choiceType: 'PT_CHECKBOX',
                 script: [
                   $class: 'GroovyScript',
-                  sandbox: true,
                   script: '''
                     def f = new File("services.txt")
                     if (!f.exists() || f.text.trim().isEmpty()) {
                       return ["KILL_EUREKA"]
                     }
                     return []
-                  '''
+                  ''',
+                  fallbackScript: 'return []'
                 ]
               ],
 
@@ -118,154 +172,44 @@ Set-Content "services.txt"
               [
                 $class: 'ChoiceParameter',
                 name: 'KILL_CONFIGSERVER',
-                description: 'Kill Config Server',
+                description: 'Kill Config Server (enabled only when alone)',
                 choiceType: 'PT_CHECKBOX',
                 script: [
                   $class: 'GroovyScript',
-                  sandbox: true,
                   script: '''
                     def f = new File("services.txt")
                     if (f.exists()) {
-                      def s = f.readLines()
-                      if (s.size() == 1 && s[0] == "CONFIGSERVER") {
+                      def lines = f.readLines()
+                      if (lines.size() == 1 && lines[0] == "CONFIGSERVER") {
                         return ["KILL_CONFIGSERVER"]
                       }
                     }
                     return []
-                  '''
-                ]
-              ],
-
-              /* ================= KILL_SERVICES ================= */
-              [
-                $class: 'ChoiceParameter',
-                name: 'KILL_SERVICES',
-                description: 'Kill Registered Services',
-                choiceType: 'PT_CHECKBOX',
-                script: [
-                  $class: 'GroovyScript',
-                  sandbox: true,
-                  script: '''
-                    def f = new File("services.txt")
-                    if (f.exists()) {
-                      return f.readLines().findAll { it != "CONFIGSERVER" }
-                    }
-                    return []
-                  '''
+                  ''',
+                  fallbackScript: 'return []'
                 ]
               ]
             ])
           ])
 
-          echo "✅ Kill checkboxes updated. Re-run build to apply selections."
+          echo "✅ Kill checkboxes updated for NEXT build"
         }
-      }
-    }
-
-    /* ============================================================
-       EXIT AFTER DISCOVERY (FIRST BUILD)
-       ============================================================ */
-
-    stage('Exit After Discovery') {
-      when { expression { env.DISCOVERY_ONLY == 'true' } }
-      steps {
-        echo '''
-✅ DISCOVERY RUN COMPLETE
-No kill or deregister executed.
-Re-run the job to enable kill actions.
-'''
-      }
-    }
-
-    /* ============================================================
-       KILL EUREKA SERVER
-       ============================================================ */
-
-    stage('Kill Eureka Server') {
-      when {
-        expression {
-          params.KILL_EUREKA?.contains('KILL_EUREKA')
-        }
-      }
-      steps {
-        withEnv(["EUREKA_PORT=${EUREKA_PORT}"]) {
-          bat '''
-            echo Killing Eureka on port %EUREKA_PORT%
-            for /f "tokens=5" %%P in (
-              'netstat -ano ^| findstr LISTENING ^| findstr :%EUREKA_PORT%'
-            ) do taskkill /F /PID %%P >nul 2>&1
-          '''
-        }
-      }
-    }
-
-    /* ============================================================
-       KILL SERVICE PROCESSES
-       ============================================================ */
-
-    stage('Kill Service Processes') {
-      when {
-        expression {
-          params.KILL_SERVICES != null && params.KILL_SERVICES.size() > 0
-        }
-      }
-      steps {
-        bat '''
-          for %%S in (%KILL_SERVICES%) do (
-            echo Killing service %%S
-          )
-        '''
-      }
-    }
-
-    /* ============================================================
-       DEREGISTER FROM EUREKA
-       ============================================================ */
-
-    stage('Deregister from Eureka') {
-      when {
-        expression {
-          params.KILL_SERVICES != null && params.KILL_SERVICES.size() > 0
-        }
-      }
-      steps {
-        withEnv(["EUREKA_PORT=${EUREKA_PORT}"]) {
-          bat '''
-            for %%S in (%KILL_SERVICES%) do (
-              curl -s -X DELETE ^
-                http://localhost:%EUREKA_PORT%/eureka/apps/%%S >nul 2>&1
-            )
-          '''
-        }
-      }
-    }
-
-    /* ============================================================
-       REFRESH CHECKBOXES (NEXT BUILD)
-       ============================================================ */
-
-    stage('Refresh Kill Checkboxes') {
-      steps {
-        echo "✅ Registry state updated. Checkboxes will reflect changes in the next build."
       }
     }
   }
 
   /* ============================================================
-     POST ACTIONS (REQUIRED)
+     POST
      ============================================================ */
-
   post {
     always {
-      echo "✅ Kill-Instances pipeline finished."
+      echo "✅ KillInstances pipeline finished"
     }
-
     success {
-      echo "✅ Pipeline executed successfully."
+      echo "✅ Pipeline completed successfully"
     }
-
     failure {
-      echo "❌ Pipeline failed. Please review the logs above."
+      echo "❌ Pipeline failed – check logs"
     }
   }
 }
