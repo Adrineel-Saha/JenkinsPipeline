@@ -31,22 +31,27 @@ pipeline {
           if (!fileExists(ymlPath)) {
             error "application.yml not found at ${ymlPath}"
           }
-          def yml = readFile ymlPath
-
-          // Match:
-          // server:
-          //   port: <digits>
-          def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
-          if (m.find()) {
-            env.EUREKA_PORT = m.group(1)
-            echo "Using server.port from application.yml: ${env.EUREKA_PORT}"
-          } else {
-            error "server.port not found in ${ymlPath}. Please define it under 'server:\\n  port: <number>'."
+    
+          def yml = readFile(ymlPath)
+    
+          /*
+           ✅ FIXES:
+           - Allows leading whitespace
+           - Handles UTF‑8 BOM if present
+           - Still enforces digits‑only port
+           */
+          def m = (yml =~ /(?m)^[\s\uFEFF]*server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)/)
+    
+          if (!m.find() || !m.group(1)) {
+            error "❌ server.port not found or not numeric in ${ymlPath}"
           }
+    
+          env.EUREKA_PORT = m.group(1)
+          echo "✅ Eureka Port = ${env.EUREKA_PORT}"
         }
       }
     }
-
+    
     stage('Fetch Eureka Registry') {
       steps {
         bat "curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml"
