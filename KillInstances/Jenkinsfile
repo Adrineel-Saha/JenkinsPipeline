@@ -46,25 +46,34 @@ pipeline {
     }
 
     /* ============================================================
-       EXTRACT REGISTERED SERVICES
+       EXTRACT REGISTERED SERVICES (CORRECT)
        ============================================================ */
     stage('Extract Registered Services') {
       steps {
         writeFile file: 'extract-services.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
-$x.applications.application |
-ForEach-Object { $_.app } |
-Sort-Object -Unique |
-Set-Content "services.txt"
+
+$services = @()
+
+$x.applications.application | ForEach-Object {
+    if ($_.instance -ne $null) {
+        $services += $_.app
+    }
+}
+
+$services |
+  Sort-Object -Unique |
+  ForEach-Object { $_.ToUpper() } |
+  Set-Content "services.txt"
 '''
         bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
 
         script {
           echo "✅ Services from Eureka:"
-          if (fileExists('services.txt')) {
+          if (fileExists('services.txt') && readFile('services.txt').trim()) {
             echo readFile('services.txt')
           } else {
-            echo "(none)"
+            echo "(no registered services)"
           }
         }
       }
@@ -141,7 +150,7 @@ Set-Content "services.txt"
     }
 
     /* ============================================================
-       UPDATE CHECKBOXES (ACTIVE CHOICES)
+       UPDATE CHECKBOXES (ACTIVE CHOICES – LAST STAGE)
        ============================================================ */
     stage('Update Kill Checkboxes') {
       steps {
@@ -158,12 +167,12 @@ Set-Content "services.txt"
                 script: [
                   $class: 'GroovyScript',
                   script: '''
-                    def f = new File("services.txt")
-                    if (!f.exists() || f.text.trim().isEmpty()) {
-                      return ["KILL_EUREKA"]
-                    }
-                    return []
-                  ''',
+def f = new File("services.txt")
+if (!f.exists() || f.text.trim().isEmpty()) {
+  return ["KILL_EUREKA"]
+}
+return []
+''',
                   fallbackScript: 'return []'
                 ]
               ],
@@ -177,15 +186,15 @@ Set-Content "services.txt"
                 script: [
                   $class: 'GroovyScript',
                   script: '''
-                    def f = new File("services.txt")
-                    if (f.exists()) {
-                      def lines = f.readLines()
-                      if (lines.size() == 1 && lines[0] == "CONFIGSERVER") {
-                        return ["KILL_CONFIGSERVER"]
-                      }
-                    }
-                    return []
-                  ''',
+def f = new File("services.txt")
+if (f.exists()) {
+  def lines = f.readLines()
+  if (lines.size() == 1 && lines[0] == "CONFIGSERVER") {
+    return ["KILL_CONFIGSERVER"]
+  }
+}
+return []
+''',
                   fallbackScript: 'return []'
                 ]
               ]
