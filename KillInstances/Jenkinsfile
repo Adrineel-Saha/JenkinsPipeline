@@ -32,17 +32,23 @@ pipeline {
             error "application.yml not found at ${ymlPath}"
           }
     
-          def yml = readFile(ymlPath)
+          def lines = readFile(ymlPath).readLines()
     
-          def matcher = (yml =~ /(?m)^[\s\uFEFF]*server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)/)
-    
-          if (!matcher.find()) {
-            error "❌ server.port not found or not numeric in ${ymlPath}"
+          def portLine = lines.find { line ->
+            line.trim().startsWith('port:')
           }
     
-          // ✅ SANDBOX SAFE
-          env.EUREKA_PORT = matcher.group(1)
+          if (!portLine) {
+            error "❌ server.port not found in ${ymlPath}"
+          }
     
+          def port = portLine.split(':')[1].trim()
+    
+          if (!(port ==~ /\d+/)) {
+            error "❌ server.port is not numeric: ${port}"
+          }
+    
+          env.EUREKA_PORT = port
           echo "✅ Eureka Port = ${env.EUREKA_PORT}"
         }
       }
