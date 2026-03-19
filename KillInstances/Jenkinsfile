@@ -28,32 +28,55 @@ pipeline {
       steps {
         script {
           def ymlPath = 'src/main/resources/application.yml'
+          echo "DEBUG: Checking file path = ${ymlPath}"
+    
           if (!fileExists(ymlPath)) {
-            error "application.yml not found at ${ymlPath}"
+            error "❌ application.yml not found at ${ymlPath}"
           }
     
-          def lines = readFile(ymlPath).readLines()
+          def content = readFile(ymlPath)
+          echo "DEBUG: application.yml length = ${content.length()} chars"
+    
+          def lines = content.readLines()
+          echo "DEBUG: Total lines = ${lines.size()}"
+    
+          int idx = 0
+          lines.each { line ->
+            echo "DEBUG: [${idx}] RAW   : >>>${line}<<<"
+            echo "DEBUG: [${idx}] TRIM  : >>>${line.trim()}<<<"
+            idx++
+          }
     
           def portLine = lines.find { line ->
             line.trim().startsWith('port:')
           }
     
-          if (!portLine) {
-            error "❌ server.port not found in ${ymlPath}"
+          if (portLine == null) {
+            error "❌ DEBUG: No line starting with 'port:' found"
           }
     
-          def port = portLine.split(':')[1].trim()
+          echo "DEBUG: Found port line = >>>${portLine}<<<"
     
-          if (!(port ==~ /\d+/)) {
-            error "❌ server.port is not numeric: ${port}"
+          def parts = portLine.split(':')
+          echo "DEBUG: Split parts = ${parts}"
+    
+          if (parts.size() < 2) {
+            error "❌ DEBUG: Unable to split port line correctly"
           }
     
-          env.EUREKA_PORT = port
+          def portValue = parts[1].trim()
+          echo "DEBUG: Extracted portValue = >>>${portValue}<<<"
+    
+          if (!(portValue ==~ /^[0-9]+$/)) {
+            error "❌ DEBUG: Port value is not numeric: ${portValue}"
+          }
+    
+          env.EUREKA_PORT = portValue
           echo "✅ Eureka Port = ${env.EUREKA_PORT}"
         }
       }
     }
-    
+        
     stage('Fetch Eureka Registry') {
       steps {
         bat "curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml"
