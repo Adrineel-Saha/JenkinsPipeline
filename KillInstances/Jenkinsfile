@@ -1,35 +1,48 @@
-def EUREKA_PORT = null
-
 pipeline {
   agent any
 
+  environment {
+    HAS_TARGETS = ''
+  }
+
   stages {
+
+    /* ============================================================
+       CLEAN WORKSPACE
+       ============================================================ */
+    stage('Clean Workspace') {
+      steps {
+        deleteDir()
+      }
+    }
 
     /* ============================================================
        CLONE EUREKA SERVER REPO
        ============================================================ */
     stage('Clone EurekaServer Repo') {
       steps {
-        git url: 'https://github.com/Adrineel-Saha/EurekaServer.git', branch: 'main'
+        dir('eureka') {
+          git url: 'https://github.com/Adrineel-Saha/EurekaServer.git', branch: 'main'
+        }
       }
     }
 
     /* ============================================================
        READ EUREKA PORT
        ============================================================ */
-    stage('Read Eureka Port') {
+    stage('Read Eureka Port from application.yml') {
       steps {
         script {
-          def line = readFile('src/main/resources/application.yml')
-            .readLines()
-            .find { it.trim().startsWith('port:') }
+          def yml = readFile('eureka/src/main/resources/application.yml')
 
-          if (!line) {
-            error 'server.port not found in application.yml'
+          // ✅ ORIGINAL APPROVED REGEX
+          def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
+          if (!m.find()) {
+            error "server.port not found in application.yml"
           }
 
-          EUREKA_PORT = line.split(':')[1].trim()
-          echo "✅ Eureka Port = ${EUREKA_PORT}"
+          env.EUREKA_PORT = m.group(1)
+          echo "✅ Eureka port resolved: ${env.EUREKA_PORT}"
         }
       }
     }
@@ -37,188 +50,193 @@ pipeline {
     /* ============================================================
        FETCH EUREKA REGISTRY
        ============================================================ */
-    stage('Fetch Eureka Registry') {
+    stage('Fetch Eureka Registry (XML)') {
       steps {
-        withEnv(["EUREKA_PORT=${EUREKA_PORT}"]) {
-          bat 'curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml'
-        }
+        bat '''
+          curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
+        '''
       }
     }
 
     /* ============================================================
-       EXTRACT REGISTERED SERVICES (CORRECT)
+       RESOLVE SELECTED INSTANCES (UP ONLY)
        ============================================================ */
-    stage('Extract Registered Services') {
+    stage('Resolve Selected Instances') {
       steps {
-        writeFile file: 'extract-services.ps1', text: '''
+        script {
+
+          writeFile file: 'resolve-targets.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 
-$services = @()
-
-$x.applications.application | ForEach-Object {
-    if ($_.instance -ne $null) {
-        $services += $_.app
+$x.applications.application |
+ForEach-Object {
+    $_.instance | Where-Object { $_.status -eq 'UP' } |
+    ForEach-Object {
+        "$($_.app)|$($_.instanceId)|$($_.port.InnerText)"
     }
-}
-
-$services |
-  Sort-Object -Unique |
-  ForEach-Object { $_.ToUpper() } |
-  Set-Content "services.txt"
+} | Set-Content "all_targets.txt"
 '''
-        bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
 
-        script {
-          echo "✅ Services from Eureka:"
-          if (fileExists('services.txt') && readFile('services.txt').trim()) {
-            echo readFile('services.txt')
-          } else {
-            echo "(no registered services)"
-          }
-        }
-      }
-    }
+          bat 'powershell -NoProfile -ExecutionPolicy Bypass -File resolve-targets.ps1'
 
-    /* ============================================================
-       RESOLVE SELECTED TARGET
-       ============================================================ */
-    stage('Resolve Selected Target') {
-      steps {
-        script {
-          echo "KILL_EUREKA       = ${params.KILL_EUREKA}"
-          echo "KILL_CONFIGSERVER = ${params.KILL_CONFIGSERVER}"
+          def selected = []
 
-          if (params.KILL_EUREKA?.contains('KILL_EUREKA')) {
-            echo "➡ Target resolved: EUREKA"
-          } else if (params.KILL_CONFIGSERVER?.contains('KILL_CONFIGSERVER')) {
-            echo "➡ Target resolved: CONFIGSERVER"
-          } else {
-            echo "➡ No kill target selected"
-          }
-        }
-      }
-    }
-
-    /* ============================================================
-       KILL PROCESS
-       ============================================================ */
-    stage('Kill Process') {
-      when {
-        expression {
-          params.KILL_EUREKA?.contains('KILL_EUREKA') ||
-          params.KILL_CONFIGSERVER?.contains('KILL_CONFIGSERVER')
-        }
-      }
-      steps {
-        script {
-          if (params.KILL_EUREKA?.contains('KILL_EUREKA')) {
-            withEnv(["EUREKA_PORT=${EUREKA_PORT}"]) {
-              bat '''
-                echo Killing Eureka on port %EUREKA_PORT%
-                for /f "tokens=5" %%P in (
-                  'netstat -ano ^| findstr LISTENING ^| findstr :%EUREKA_PORT%'
-                ) do taskkill /F /PID %%P >nul 2>&1
-              '''
+          if (fileExists('all_targets.txt')) {
+            readFile('all_targets.txt').readLines().each { line ->
+              def parts = line.split('\\|')
+              if (parts.size() == 3) {
+                def app = parts[0].toUpperCase()
+                if (params["KILL_${app}"] == true) {
+                  selected << line
+                }
+              }
             }
           }
 
-          if (params.KILL_CONFIGSERVER?.contains('KILL_CONFIGSERVER')) {
-            echo "✅ Config Server kill logic goes here"
-          }
+          writeFile file: 'final_targets.txt', text: selected.join('\n')
+          env.HAS_TARGETS = selected ? 'yes' : ''
+
+          echo "✅ Selected targets:"
+          echo selected ? selected.join('\n') : '(none)'
         }
+      }
+    }
+
+    /* ============================================================
+       KILL PROCESSES
+       ============================================================ */
+    stage('Kill Processes') {
+      when { expression { env.HAS_TARGETS == 'yes' } }
+      steps {
+        bat '''
+          @echo off
+          for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
+            echo Killing %%A on port %%C
+            for /f "tokens=5" %%P in (
+              'netstat -ano ^| findstr LISTENING ^| findstr :%%C'
+            ) do taskkill /F /PID %%P >nul 2>&1 || echo PID %%P already stopped
+          )
+          exit /b 0
+        '''
       }
     }
 
     /* ============================================================
        DEREGISTER FROM EUREKA
        ============================================================ */
-    stage('Deregister') {
-      when {
-        expression {
-          params.KILL_CONFIGSERVER?.contains('KILL_CONFIGSERVER')
-        }
-      }
+    stage('Deregister from Eureka') {
+      when { expression { env.HAS_TARGETS == 'yes' } }
       steps {
-        withEnv(["EUREKA_PORT=${EUREKA_PORT}"]) {
-          bat '''
-            echo Deregistering CONFIGSERVER from Eureka
+        bat '''
+          for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
+            echo Deregistering %%A
             curl -s -X DELETE ^
-              http://localhost:%EUREKA_PORT%/eureka/apps/CONFIGSERVER >nul 2>&1
-          '''
+              http://localhost:%EUREKA_PORT%/eureka/apps/%%A/%%B >nul 2>&1
+          )
+        '''
+      }
+    }
+
+    /* ============================================================
+       WAIT FOR EUREKA REGISTRY TO STABILIZE
+       ============================================================ */
+    stage('Wait for Eureka Registry Refresh') {
+      steps {
+        script {
+          int maxRetries = 6
+          int sleepSeconds = 5
+
+          for (int i = 1; i <= maxRetries; i++) {
+            echo "Polling Eureka registry (attempt ${i}/${maxRetries})"
+
+            bat '''
+              curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
+            '''
+
+            writeFile file: 'extract-services.ps1', text: '''
+[xml]$x = Get-Content "apps.xml"
+
+$x.applications.application |
+ForEach-Object {
+    $up = $_.instance | Where-Object { $_.status -eq 'UP' }
+    if ($up) { $_.name }
+} | Set-Content "services.txt"
+'''
+
+            bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
+
+            def services = readFile('services.txt')
+              .readLines()
+              .collect { it.trim().toUpperCase() }
+              .findAll { it }
+
+            echo "UP services in Eureka: ${services}"
+
+            if (services.isEmpty() || services == ['CONFIGSERVER']) {
+              echo "✅ Eureka registry stabilized."
+              break
+            }
+
+            echo "Registry not yet stable. Waiting ${sleepSeconds}s..."
+            sleep sleepSeconds
+          }
         }
       }
     }
 
     /* ============================================================
-       UPDATE CHECKBOXES (ACTIVE CHOICES – LAST STAGE)
+       CREATE SERVICE CHECKBOXES (LAST STAGE)
        ============================================================ */
-    stage('Update Kill Checkboxes') {
+    stage('Create Service Checkboxes') {
       steps {
         script {
+
+          def services = fileExists('services.txt')
+            ? readFile('services.txt').readLines().collect { it.trim().toUpperCase() }.findAll { it }
+            : []
+
+          echo "FINAL active services: ${services}"
+
+          def paramsList = []
+
+          if (services.isEmpty()) {
+            paramsList << booleanParam(
+              name: 'KILL_EUREKA',
+              defaultValue: false,
+              description: 'Kill Eureka Server'
+            )
+          }
+
+          if (services == ['CONFIGSERVER']) {
+            paramsList << booleanParam(
+              name: 'KILL_CONFIGSERVER',
+              defaultValue: false,
+              description: 'Kill Config Server'
+            )
+          }
+
+          services.findAll { it != 'CONFIGSERVER' }.each { svc ->
+            paramsList << booleanParam(
+              name: "KILL_${svc}",
+              defaultValue: false,
+              description: "Kill ${svc}"
+            )
+          }
+
           properties([
-            parameters([
-
-              /* ================= KILL_EUREKA ================= */
-              [
-                $class: 'ChoiceParameter',
-                name: 'KILL_EUREKA',
-                description: 'Kill Eureka Server (enabled only when no services)',
-                choiceType: 'PT_CHECKBOX',
-                script: [
-                  $class: 'GroovyScript',
-                  script: '''
-def f = new File("services.txt")
-if (!f.exists() || f.text.trim().isEmpty()) {
-  return ["KILL_EUREKA"]
-}
-return []
-''',
-                  fallbackScript: 'return []'
-                ]
-              ],
-
-              /* ================= KILL_CONFIGSERVER ================= */
-              [
-                $class: 'ChoiceParameter',
-                name: 'KILL_CONFIGSERVER',
-                description: 'Kill Config Server (enabled only when alone)',
-                choiceType: 'PT_CHECKBOX',
-                script: [
-                  $class: 'GroovyScript',
-                  script: '''
-def f = new File("services.txt")
-if (f.exists()) {
-  def lines = f.readLines()
-  if (lines.size() == 1 && lines[0] == "CONFIGSERVER") {
-    return ["KILL_CONFIGSERVER"]
-  }
-}
-return []
-''',
-                  fallbackScript: 'return []'
-                ]
-              ]
-            ])
+            [$class: 'ParametersDefinitionProperty',
+             parameterDefinitions: paramsList]
           ])
 
-          echo "✅ Kill checkboxes updated for NEXT build"
+          echo "✅ Parameters generated correctly for NEXT build."
         }
       }
     }
   }
 
-  /* ============================================================
-     POST
-     ============================================================ */
   post {
     always {
-      echo "✅ KillInstances pipeline finished"
-    }
-    success {
-      echo "✅ Pipeline completed successfully"
-    }
-    failure {
-      echo "❌ Pipeline failed – check logs"
+      echo "✅ KillInstances finished successfully."
     }
   }
 }
