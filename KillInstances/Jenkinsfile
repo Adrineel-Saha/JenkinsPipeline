@@ -1,10 +1,28 @@
 pipeline {
   agent any
 
+  environment {
+    // ✅ Freeze Eureka kill intent for the whole build
+    KILL_EUREKA_SELECTED = 'false'
+  }
+
   stages {
 
     stage('Clean Workspace') {
       steps { deleteDir() }
+    }
+
+    stage('Capture User Intent') {
+      steps {
+        script {
+          if (params?.KILL_EUREKA) {
+            env.KILL_EUREKA_SELECTED = 'true'
+            echo "KILL_EUREKA intent captured."
+          } else {
+            echo "No KILL_EUREKA intent."
+          }
+        }
+      }
     }
 
     stage('Clone EurekaServer Repo') {
@@ -68,6 +86,10 @@ ForEach-Object {
 
           writeFile file: 'final_targets.txt', text: selected.join('\n')
           env.HAS_TARGETS = selected ? 'yes' : ''
+
+          if (!env.HAS_TARGETS) {
+            echo "Discovery build detected (no services selected)."
+          }
         }
       }
     }
@@ -106,8 +128,6 @@ ForEach-Object {
           int sleepSeconds = 5
 
           for (int i = 1; i <= maxRetries; i++) {
-            echo "Polling Eureka registry (attempt ${i}/${maxRetries})"
-
             bat 'curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml'
 
             writeFile file: 'extract-instance-ids.ps1', text: '''
@@ -120,14 +140,7 @@ ForEach-Object {
             bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-instance-ids.ps1'
 
             def ids = readFile('instance_ids.txt').readLines().findAll { it }
-
-            echo "Instance IDs still present: ${ids}"
-
-            if (ids.isEmpty()) {
-              echo "Eureka registry stabilized."
-              break
-            }
-
+            if (ids.isEmpty()) break
             sleep sleepSeconds
           }
         }
@@ -138,7 +151,6 @@ ForEach-Object {
       steps {
         script {
 
-          // ✅ ALWAYS regenerate services.txt here
           writeFile file: 'extract-services.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 $x.applications.application |
@@ -158,8 +170,8 @@ ForEach-Object {
 
           echo "FINAL active services: ${services}"
 
-          // ✅ If Eureka was killed → clear all parameters
-          if (params?.KILL_EUREKA) {
+          // ✅ USE FROZEN VALUE — NOT params
+          if (env.KILL_EUREKA_SELECTED == 'true') {
             echo "Eureka Server killed. Clearing parameters."
             properties([])
             currentBuild.result = 'SUCCESS'
