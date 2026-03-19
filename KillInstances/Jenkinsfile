@@ -27,11 +27,22 @@ pipeline {
     stage('Read Eureka Port') {
       steps {
         script {
-          def yml = readFile('src/main/resources/application.yml')
+          def ymlPath = 'src/main/resources/application.yml'
+          if (!fileExists(ymlPath)) {
+            error "application.yml not found at ${ymlPath}"
+          }
+          def yml = readFile ymlPath
+
+          // Match:
+          // server:
+          //   port: <digits>
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
-          if (!m.find()) error "server.port not found"
-          env.EUREKA_PORT = m.group(1)
-          echo "✅ Eureka Port = ${env.EUREKA_PORT}"
+          if (m.find()) {
+            env.EUREKA_PORT = m.group(1)
+            echo "Using server.port from application.yml: ${env.EUREKA_PORT}"
+          } else {
+            error "server.port not found in ${ymlPath}. Please define it under 'server:\\n  port: <number>'."
+          }
         }
       }
     }
