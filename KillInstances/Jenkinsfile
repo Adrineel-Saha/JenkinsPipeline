@@ -2,20 +2,30 @@ pipeline {
   agent any
 
   environment {
-    EUREKA_PORT         = ''
     DISCOVERY_ONLY      = 'false'
     HAS_SERVICE_TARGETS = 'false'
     STATE_CHANGED       = 'false'
   }
+}
+
+/* ============================================================
+   ✅ Groovy-scoped variables (SAFE for computed values)
+   ============================================================ */
+def EUREKA_PORT_VALUE = null
+
+pipeline {
+  agent any
 
   stages {
 
     /* ============================================================
-       CLEAN + DISCOVERY
+       CLEAN + CLONE
        ============================================================ */
 
     stage('Clean Workspace') {
-      steps { deleteDir() }
+      steps {
+        deleteDir()
+      }
     }
 
     stage('Clone EurekaServer Repo') {
@@ -24,72 +34,54 @@ pipeline {
       }
     }
 
+    /* ============================================================
+       READ EUREKA PORT (ROBUST, NO ENV MUTATION)
+       ============================================================ */
+
     stage('Read Eureka Port') {
       steps {
         script {
           def ymlPath = 'src/main/resources/application.yml'
-          echo "DEBUG: Checking file path = ${ymlPath}"
-    
+          echo "Reading Eureka port from ${ymlPath}"
+
           if (!fileExists(ymlPath)) {
-            error "❌ application.yml not found at ${ymlPath}"
+            error "application.yml not found at ${ymlPath}"
           }
-    
-          def content = readFile(ymlPath)
-          echo "DEBUG: application.yml length = ${content.length()} chars"
-    
-          def lines = content.readLines()
-          echo "DEBUG: Total lines = ${lines.size()}"
-    
-          int idx = 0
-          lines.each { line ->
-            echo "DEBUG: [${idx}] RAW   : >>>${line}<<<"
-            echo "DEBUG: [${idx}] TRIM  : >>>${line.trim()}<<<"
-            idx++
-          }
-    
-          def portLine = lines.find { line ->
-            line.trim().startsWith('port:')
-          }
-    
-          if (portLine == null) {
-            error "❌ DEBUG: No line starting with 'port:' found"
-          }
-    
-          echo "DEBUG: Found port line = >>>${portLine}<<<"
-    
-          def parts = portLine.split(':')
-          echo "DEBUG: Split parts = ${parts}"
-    
-          if (parts.size() < 2) {
-            error "❌ DEBUG: Unable to split port line correctly"
-          }
-    
-          def portValue = parts[1].trim()
-          echo "DEBUG: Extracted portValue = >>>${portValue}<<<"
-    
-          if (!(portValue ==~ /^[0-9]+$/)) {
-            error "❌ DEBUG: Port value is not numeric: ${portValue}"
-          }
-    
-          
-        // ✅ FORCE STRING + CPS SAFE
-        env.EUREKA_PORT = portValue.toString()
 
-        // ✅ NO GSTRING
-        echo "✅ Eureka Port = " + env.EUREKA_PORT
+          def lines = readFile(ymlPath).readLines()
 
+          def portLine = lines.find { it.trim().startsWith('port:') }
+          if (!portLine) {
+            error "server.port not found in application.yml"
+          }
+
+          def portValue = portLine.split(':')[1].trim()
+          if (!(portValue ==~ /^\d+$/)) {
+            error "server.port is not numeric: ${portValue}"
+          }
+
+          // ✅ Store in Groovy variable
+          EUREKA_PORT_VALUE = portValue
+
+          echo "✅ Eureka Port resolved = ${EUREKA_PORT_VALUE}"
         }
-      }
-    }
-        
-    stage('Fetch Eureka Registry') {
-      steps {
-        bat "curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml"
       }
     }
 
     /* ============================================================
-       CREATE / UPDATE PARAMETERS (DISCOVERY)
+       FETCH EUREKA REGISTRY (withEnv injection)
+       ============================================================ */
+
+    stage('Fetch Eureka Registry') {
+      steps {
+        withEnv(["EUREKA_PORT=${EUREKA_PORT_VALUE}"]) {
+          bat 'curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml'
+        }
+      }
+    }
+
+    /* ============================================================
+       DISCOVERY → CREATE CHECKBOXES
        ============================================================ */
 
     stage('Create / Update Service Checkboxes') {
@@ -113,21 +105,16 @@ ForEach-Object {
               .findAll { it }
           }
 
-          echo "✅ Services registered in Eureka: ${services}"
+          echo "Active services: ${services}"
 
           def paramsList = []
 
-          /* ✅ KILL_EUREKA always exists */
           paramsList << booleanParam(
             name: 'KILL_EUREKA',
             defaultValue: false,
             description: 'Kill Eureka Server'
           )
 
-          /*
-           ✅ KILL_CONFIGSERVER rule preserved:
-           - Only appears when it is the ONLY service
-          */
           if (services == ['CONFIGSERVER']) {
             paramsList << booleanParam(
               name: 'KILL_CONFIGSERVER',
@@ -136,13 +123,7 @@ ForEach-Object {
             )
           }
 
-          /*
-           ✅ KILL_{SERVICE} rule preserved:
-           - CONFIGSERVER excluded when other services exist
-          */
-          services.findAll {
-            it != 'CONFIGSERVER'
-          }.each { svc ->
+          services.findAll { it != 'CONFIGSERVER' }.each { svc ->
             paramsList << booleanParam(
               name: "KILL_${svc}",
               defaultValue: false,
@@ -155,7 +136,6 @@ ForEach-Object {
              parameterDefinitions: paramsList]
           ])
 
-          /* ✅ First-time discovery guard */
           if (currentBuild.rawBuild.getAction(hudson.model.ParametersAction) == null) {
             env.DISCOVERY_ONLY = 'true'
           }
@@ -167,12 +147,9 @@ ForEach-Object {
       when { expression { env.DISCOVERY_ONLY == 'true' } }
       steps {
         echo '''
-✅ DISCOVERY COMPLETE
-
-Parameters have been created/updated.
-➡ Please re-run the job and select services to kill.
-
-(No actions executed in this run.)
+✅ DISCOVERY RUN COMPLETE
+Parameters updated.
+➡ Re-run the job with selections.
 '''
       }
     }
@@ -210,7 +187,7 @@ ForEach-Object {
 
           if (selected) {
             env.HAS_SERVICE_TARGETS = 'true'
-            echo "✅ Selected targets:\n${selected.join('\n')}"
+            echo "Targets selected:\n${selected.join('\n')}"
           }
         }
       }
@@ -225,12 +202,14 @@ ForEach-Object {
       }
       steps {
         script { env.STATE_CHANGED = 'true' }
-        bat '''
-          echo Killing Eureka on port %EUREKA_PORT%
-          for /f "tokens=5" %%P in (
-            'netstat -ano ^| findstr LISTENING ^| findstr :%EUREKA_PORT%'
-          ) do taskkill /F /PID %%P >nul 2>&1
-        '''
+        withEnv(["EUREKA_PORT=${EUREKA_PORT_VALUE}"]) {
+          bat '''
+            echo Killing Eureka on port %EUREKA_PORT%
+            for /f "tokens=5" %%P in (
+              'netstat -ano ^| findstr LISTENING ^| findstr :%EUREKA_PORT%'
+            ) do taskkill /F /PID %%P >nul 2>&1
+          '''
+        }
       }
     }
 
@@ -245,7 +224,6 @@ ForEach-Object {
         script { env.STATE_CHANGED = 'true' }
         bat '''
           for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
-            echo Killing %%A on port %%C
             for /f "tokens=5" %%P in (
               'netstat -ano ^| findstr LISTENING ^| findstr :%%C'
             ) do taskkill /F /PID %%P >nul 2>&1
@@ -263,27 +241,23 @@ ForEach-Object {
         }
       }
       steps {
-        bat '''
-          for /f "tokens=1,2 delims=|" %%A in (final_targets.txt) do (
-            echo Deregistering %%A
-            curl -s -X DELETE ^
-              http://localhost:%EUREKA_PORT%/eureka/apps/%%A/%%B >nul 2>&1
-          )
-        '''
+        withEnv(["EUREKA_PORT=${EUREKA_PORT_VALUE}"]) {
+          bat '''
+            for /f "tokens=1,2 delims=|" %%A in (final_targets.txt) do (
+              curl -s -X DELETE ^
+                http://localhost:%EUREKA_PORT%/eureka/apps/%%A/%%B >nul 2>&1
+            )
+          '''
+        }
       }
     }
-
-    /* ============================================================
-       PARAMETER REFRESH FOR NEXT BUILD
-       ============================================================ */
 
     stage('Refresh Checkboxes For Next Build') {
       when { expression { env.STATE_CHANGED == 'true' } }
       steps {
         echo '''
 🔄 State changed.
-Service checkboxes have been refreshed
-and will reflect Eureka registry in the NEXT build.
+Next build will show updated service checkboxes.
 '''
       }
     }
