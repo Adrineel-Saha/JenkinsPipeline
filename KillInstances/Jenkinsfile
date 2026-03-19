@@ -2,7 +2,9 @@ pipeline {
   agent any
 
   environment {
+    // Freeze user intent for this build
     KILL_EUREKA_SELECTED = 'false'
+    HAS_SERVICE_TARGETS  = 'false'
   }
 
   stages {
@@ -14,9 +16,9 @@ pipeline {
     stage('Capture User Intent') {
       steps {
         script {
-          if (params?.KILL_EUREKA) {
+          if (params?.KILL_EUREKA == true) {
             env.KILL_EUREKA_SELECTED = 'true'
-            echo "KILL_EUREKA intent captured."
+            echo "KILL_EUREKA intent captured"
           }
         }
       }
@@ -55,9 +57,9 @@ pipeline {
 [xml]$x = Get-Content "apps.xml"
 $x.applications.application |
 ForEach-Object {
-    $_.instance | ForEach-Object {
-        "$($_.app)|$($_.instanceId)|$($_.port.InnerText)"
-    }
+  $_.instance | ForEach-Object {
+    "$($_.app)|$($_.instanceId)|$($_.port.InnerText)"
+  }
 } | Set-Content "all_targets.txt"
 '''
           bat 'powershell -NoProfile -ExecutionPolicy Bypass -File resolve-targets.ps1'
@@ -66,12 +68,9 @@ ForEach-Object {
 
           if (params) {
             readFile('all_targets.txt').readLines().each { line ->
-              def parts = line.split('\\|')
-              if (parts.size() == 3) {
-                def app = parts[0].toUpperCase()
-                if (params["KILL_${app}"]) {
-                  selected << line
-                }
+              def p = line.split('\\|')
+              if (p.size() == 3 && params["KILL_${p[0].toUpperCase()}"] == true) {
+                selected << line
               }
             }
           }
@@ -79,20 +78,17 @@ ForEach-Object {
           writeFile file: 'final_targets.txt', text: selected.join('\n')
 
           if (selected) {
-            env.HAS_TARGETS = 'yes'
-          } else {
-            env.HAS_TARGETS = ''
+            env.HAS_SERVICE_TARGETS = 'true'
           }
         }
       }
     }
 
-    // ✅ NEW: Explicit Eureka Kill
+    // ✅ EXPLICIT EUREKA KILL
     stage('Kill Eureka Server') {
       when { expression { env.KILL_EUREKA_SELECTED == 'true' } }
       steps {
         bat '''
-          @echo off
           echo Killing Eureka on port %EUREKA_PORT%
           for /f "tokens=5" %%P in (
             'netstat -ano ^| findstr LISTENING ^| findstr :%EUREKA_PORT%'
@@ -102,10 +98,9 @@ ForEach-Object {
     }
 
     stage('Kill Service Processes') {
-      when { expression { env.HAS_TARGETS == 'yes' } }
+      when { expression { env.HAS_SERVICE_TARGETS == 'true' } }
       steps {
         bat '''
-          @echo off
           for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
             for /f "tokens=5" %%P in (
               'netstat -ano ^| findstr LISTENING ^| findstr :%%C'
@@ -118,7 +113,8 @@ ForEach-Object {
     stage('Deregister from Eureka') {
       when {
         expression {
-          env.HAS_TARGETS == 'yes' && env.KILL_EUREKA_SELECTED != 'true'
+          env.HAS_SERVICE_TARGETS == 'true' &&
+          env.KILL_EUREKA_SELECTED != 'true'
         }
       }
       steps {
@@ -132,43 +128,59 @@ ForEach-Object {
     }
 
     stage('Create Service Checkboxes') {
+      when { expression { env.KILL_EUREKA_SELECTED != 'true' } }
       steps {
         script {
-
-          // ✅ After killing Eureka → clear params
-          if (env.KILL_EUREKA_SELECTED == 'true') {
-            echo "Eureka Server killed. Clearing parameters."
-            properties([])
-            return
-          }
 
           writeFile file: 'extract-services.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 $x.applications.application |
 ForEach-Object {
-    $_.instance | ForEach-Object { $_.app }
+  $_.instance | ForEach-Object { $_.app }
 } | Sort-Object -Unique | Set-Content "services.txt"
 '''
           bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
 
-          def services = readFile('services.txt')
-            .readLines()
-            .collect { it.trim().toUpperCase() }
+          def services = []
+          if (fileExists('services.txt')) {
+            services = readFile('services.txt')
+              .readLines()
+              .collect { it.trim().toUpperCase() }
+          }
 
           def paramsList = []
 
           if (services.isEmpty()) {
-            paramsList << booleanParam('KILL_EUREKA', false, 'Kill Eureka Server')
+            paramsList << booleanParam(
+              name: 'KILL_EUREKA',
+              defaultValue: false,
+              description: 'Kill Eureka Server'
+            )
           }
 
-          services.findAll { it != 'CONFIGSERVER' }.each {
-            paramsList << booleanParam("KILL_${it}", false, "Kill ${it}")
+          services.each { svc ->
+            paramsList << booleanParam(
+              name: "KILL_${svc}",
+              defaultValue: false,
+              description: "Kill ${svc}"
+            )
           }
 
           properties([
             [$class: 'ParametersDefinitionProperty',
              parameterDefinitions: paramsList]
           ])
+        }
+      }
+    }
+
+    // ✅ CLEAR PARAMETERS AFTER EUREKA KILL
+    stage('Clear Parameters After Eureka Kill') {
+      when { expression { env.KILL_EUREKA_SELECTED == 'true' } }
+      steps {
+        script {
+          echo "Clearing all parameters after Eureka kill"
+          properties([])
         }
       }
     }
