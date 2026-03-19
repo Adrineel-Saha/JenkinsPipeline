@@ -3,6 +3,7 @@ pipeline {
 
   environment {
     HAS_TARGETS = ''
+    HAS_PARAMS  = ''
   }
 
   stages {
@@ -11,9 +12,7 @@ pipeline {
        CLEAN WORKSPACE
        ============================================================ */
     stage('Clean Workspace') {
-      steps {
-        deleteDir()
-      }
+      steps { deleteDir() }
     }
 
     /* ============================================================
@@ -34,13 +33,8 @@ pipeline {
       steps {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
-
-          // ✅ ORIGINAL APPROVED REGEX
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
-          if (!m.find()) {
-            error "server.port not found in application.yml"
-          }
-
+          if (!m.find()) error "server.port not found"
           env.EUREKA_PORT = m.group(1)
           echo "✅ Eureka port resolved: ${env.EUREKA_PORT}"
         }
@@ -52,52 +46,49 @@ pipeline {
        ============================================================ */
     stage('Fetch Eureka Registry (XML)') {
       steps {
-        bat '''
-          curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
-        '''
+        bat 'curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml'
       }
     }
 
     /* ============================================================
-       RESOLVE SELECTED INSTANCES (UP ONLY)
+       RESOLVE SELECTED INSTANCES
        ============================================================ */
     stage('Resolve Selected Instances') {
       steps {
         script {
+          env.HAS_PARAMS = params ? 'yes' : ''
+
+          if (!env.HAS_PARAMS) {
+            echo "ℹ️ No parameters yet – discovery build"
+            return
+          }
 
           writeFile file: 'resolve-targets.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
-
 $x.applications.application |
 ForEach-Object {
-    $_.instance | Where-Object { $_.status -eq 'UP' } |
-    ForEach-Object {
-        "$($_.app)|$($_.instanceId)|$($_.port.InnerText)"
-    }
+  $_.instance | Where-Object { $_.status -eq 'UP' } |
+  ForEach-Object {
+    "$($_.app)|$($_.instanceId)|$($_.port.InnerText)"
+  }
 } | Set-Content "all_targets.txt"
 '''
-
           bat 'powershell -NoProfile -ExecutionPolicy Bypass -File resolve-targets.ps1'
 
           def selected = []
 
-          if (fileExists('all_targets.txt')) {
-            readFile('all_targets.txt').readLines().each { line ->
-              def parts = line.split('\\|')
-              if (parts.size() == 3) {
-                def app = parts[0].toUpperCase()
-                if (params["KILL_${app}"] == true) {
-                  selected << line
-                }
+          readFile('all_targets.txt').readLines().each { line ->
+            def parts = line.split('\\|')
+            if (parts.size() == 3) {
+              def app = parts[0].toUpperCase()
+              if (params["KILL_${app}"] == true) {
+                selected << line
               }
             }
           }
 
           writeFile file: 'final_targets.txt', text: selected.join('\n')
           env.HAS_TARGETS = selected ? 'yes' : ''
-
-          echo "✅ Selected targets:"
-          echo selected ? selected.join('\n') : '(none)'
         }
       }
     }
@@ -106,17 +97,14 @@ ForEach-Object {
        KILL PROCESSES
        ============================================================ */
     stage('Kill Processes') {
-      when { expression { env.HAS_TARGETS == 'yes' } }
+      when { expression { env.HAS_PARAMS == 'yes' && env.HAS_TARGETS == 'yes' } }
       steps {
         bat '''
-          @echo off
           for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
-            echo Killing %%A on port %%C
             for /f "tokens=5" %%P in (
               'netstat -ano ^| findstr LISTENING ^| findstr :%%C'
-            ) do taskkill /F /PID %%P >nul 2>&1 || echo PID %%P already stopped
+            ) do taskkill /F /PID %%P >nul 2>&1
           )
-          exit /b 0
         '''
       }
     }
@@ -125,62 +113,14 @@ ForEach-Object {
        DEREGISTER FROM EUREKA
        ============================================================ */
     stage('Deregister from Eureka') {
-      when { expression { env.HAS_TARGETS == 'yes' } }
+      when { expression { env.HAS_PARAMS == 'yes' && env.HAS_TARGETS == 'yes' } }
       steps {
         bat '''
           for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
-            echo Deregistering %%A
             curl -s -X DELETE ^
               http://localhost:%EUREKA_PORT%/eureka/apps/%%A/%%B >nul 2>&1
           )
         '''
-      }
-    }
-
-    /* ============================================================
-       WAIT FOR EUREKA REGISTRY TO STABILIZE
-       ============================================================ */
-    stage('Wait for Eureka Registry Refresh') {
-      steps {
-        script {
-          int maxRetries = 6
-          int sleepSeconds = 5
-
-          for (int i = 1; i <= maxRetries; i++) {
-            echo "Polling Eureka registry (attempt ${i}/${maxRetries})"
-
-            bat '''
-              curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
-            '''
-
-            writeFile file: 'extract-services.ps1', text: '''
-[xml]$x = Get-Content "apps.xml"
-
-$x.applications.application |
-ForEach-Object {
-    $up = $_.instance | Where-Object { $_.status -eq 'UP' }
-    if ($up) { $_.name }
-} | Set-Content "services.txt"
-'''
-
-            bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
-
-            def services = readFile('services.txt')
-              .readLines()
-              .collect { it.trim().toUpperCase() }
-              .findAll { it }
-
-            echo "UP services in Eureka: ${services}"
-
-            if (services.isEmpty() || services == ['CONFIGSERVER']) {
-              echo "✅ Eureka registry stabilized."
-              break
-            }
-
-            echo "Registry not yet stable. Waiting ${sleepSeconds}s..."
-            sleep sleepSeconds
-          }
-        }
       }
     }
 
@@ -191,35 +131,29 @@ ForEach-Object {
       steps {
         script {
 
-          def services = fileExists('services.txt')
-            ? readFile('services.txt').readLines().collect { it.trim().toUpperCase() }.findAll { it }
-            : []
+          def services = []
 
-          echo "FINAL active services: ${services}"
+          writeFile file: 'extract-services.ps1', text: '''
+[xml]$x = Get-Content "apps.xml"
+$x.applications.application |
+ForEach-Object {
+  if ($_.instance) { $_.app }
+} | Sort-Object -Unique | Set-Content "services.txt"
+'''
+          bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
+
+          services = readFile('services.txt')
+            .readLines()
+            .collect { it.trim().toUpperCase() }
+            .findAll { it }
 
           def paramsList = []
 
-          if (services.isEmpty()) {
+          services.each {
             paramsList << booleanParam(
-              name: 'KILL_EUREKA',
+              name: "KILL_${it}",
               defaultValue: false,
-              description: 'Kill Eureka Server'
-            )
-          }
-
-          if (services == ['CONFIGSERVER']) {
-            paramsList << booleanParam(
-              name: 'KILL_CONFIGSERVER',
-              defaultValue: false,
-              description: 'Kill Config Server'
-            )
-          }
-
-          services.findAll { it != 'CONFIGSERVER' }.each { svc ->
-            paramsList << booleanParam(
-              name: "KILL_${svc}",
-              defaultValue: false,
-              description: "Kill ${svc}"
+              description: "Kill ${it}"
             )
           }
 
@@ -228,7 +162,7 @@ ForEach-Object {
              parameterDefinitions: paramsList]
           ])
 
-          echo "✅ Parameters generated correctly for NEXT build."
+          echo "✅ Parameters created for NEXT build"
         }
       }
     }
@@ -236,7 +170,7 @@ ForEach-Object {
 
   post {
     always {
-      echo "✅ KillInstances finished successfully."
+      echo "✅ KillInstances pipeline finished"
     }
   }
 }
