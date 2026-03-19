@@ -29,7 +29,7 @@ pipeline {
     stage('Read Eureka Port') {
       steps {
         script {
-          def yml = readFile('eureka/src/main/resources/application.yml')
+          def yml = readFile('src/main/resources/application.yml')
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
           if (!m.find()) error "server.port not found"
           env.EUREKA_PORT = m.group(1)
