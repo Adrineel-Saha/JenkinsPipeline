@@ -71,8 +71,13 @@ pipeline {
             error "❌ DEBUG: Port value is not numeric: ${portValue}"
           }
     
-          env.EUREKA_PORT = portValue
-          echo "✅ Eureka Port = ${env.EUREKA_PORT}"
+          
+        // ✅ FORCE STRING + CPS SAFE
+        env.EUREKA_PORT = portValue.toString()
+
+        // ✅ NO GSTRING
+        echo "✅ Eureka Port = " + env.EUREKA_PORT
+
         }
       }
     }
