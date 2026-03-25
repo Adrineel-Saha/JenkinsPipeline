@@ -4,7 +4,9 @@ pipeline {
   stages {
 
     stage('Clean Workspace') {
-      steps { deleteDir() }
+      steps {
+        deleteDir()
+      }
     }
 
     stage('Clone EurekaServer Repo') {
@@ -19,13 +21,12 @@ pipeline {
       steps {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
-
-          // ✅ ORIGINAL, APPROVED REGEX — UNCHANGED
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
-          if (!m.find()) error "server.port not found"
-
+          if (!m.find()) {
+            error 'server.port not found in application.yml'
+          }
           env.EUREKA_PORT = m.group(1)
-          echo "Eureka port resolved."
+          echo "Eureka port resolved: ${env.EUREKA_PORT}"
         }
       }
     }
@@ -38,11 +39,11 @@ pipeline {
       }
     }
 
-    stage('Resolve Selected Instances') {
+    stage('Resolve UP Instances Only') {
       steps {
         script {
 
-          // ✅ Resolve ONLY instances that are UP
+          // ✅ PowerShell parses XML (NO XmlSlurper)
           writeFile file: 'resolve-targets.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 
@@ -54,17 +55,18 @@ ForEach-Object {
     }
 } | Set-Content "all_targets.txt"
 '''
-
           bat 'powershell -NoProfile -ExecutionPolicy Bypass -File resolve-targets.ps1'
 
           def selected = []
 
-          readFile('all_targets.txt').readLines().each { line ->
-            def parts = line.split('\\|')
-            if (parts.size() == 3) {
-              def app = parts[0].toUpperCase()
-              if (params["KILL_${app}"]) {
-                selected << line
+          if (fileExists('all_targets.txt')) {
+            readFile('all_targets.txt').readLines().each { line ->
+              def parts = line.split('\\|')
+              if (parts.size() == 3) {
+                def app = parts[0].toUpperCase()
+                if (params["KILL_${app}"]) {
+                  selected << line
+                }
               }
             }
           }
@@ -83,9 +85,10 @@ ForEach-Object {
           for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
             for /f "tokens=5" %%P in (
               'netstat -ano ^| findstr LISTENING ^| findstr :%%C'
-            ) do taskkill /F /PID %%P >nul 2>&1 || echo PID %%P already stopped
+            ) do (
+              taskkill /F /PID %%P >nul 2>&1 || echo PID %%P already stopped
+            )
           )
-          exit /b 0
         '''
       }
     }
@@ -102,51 +105,47 @@ ForEach-Object {
       }
     }
 
-    // =================================================
-    // ✅ WAIT FOR EUREKA REGISTRY TO REFLECT REAL STATE
-    // =================================================
     stage('Wait for Eureka Registry Refresh') {
       steps {
         script {
-          int maxRetries = 6
-          int sleepSeconds = 5
+          int retries = 6
+          int waitSec = 5
 
-          for (int i = 1; i <= maxRetries; i++) {
-            echo "Polling Eureka registry (attempt ${i}/${maxRetries})"
+          for (int i = 1; i <= retries; i++) {
+            echo "Polling Eureka registry (attempt ${i}/${retries})"
 
             bat '''
               curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
             '''
 
-            // ✅ Extract ONLY services with UP instances
             writeFile file: 'extract-services.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 
+$services = @()
+
 $x.applications.application |
 ForEach-Object {
-    $up = $_.instance | Where-Object { $_.status -eq 'UP' }
-    if ($up) {
-        $_.name
+    if ($_.instance | Where-Object { $_.status -eq 'UP' }) {
+        $services += $_.name
     }
-} | Set-Content "services.txt"
-'''
+}
 
+$services | Set-Content "services.txt"
+'''
             bat 'powershell -NoProfile -ExecutionPolicy Bypass -File extract-services.ps1'
 
-            def services = readFile('services.txt')
-              .readLines()
-              .collect { it.trim().toUpperCase() }
-              .findAll { it }
+            def services = fileExists('services.txt')
+              ? readFile('services.txt').readLines().findAll { it.trim() }
+              : []
 
-            echo "UP services in Eureka: ${services}"
-
-            if (services.isEmpty() || services == ['CONFIGSERVER']) {
-              echo "Eureka registry stabilized."
+            if (services.isEmpty()) {
+              writeFile file: 'services.txt', text: ''
+              echo 'Eureka registry is EMPTY'
               break
             }
 
-            echo "Registry not yet stable. Waiting ${sleepSeconds}s..."
-            sleep sleepSeconds
+            echo "Services still present: ${services}"
+            sleep waitSec
           }
         }
       }
@@ -156,38 +155,32 @@ ForEach-Object {
       steps {
         script {
 
-          def services = readFile('services.txt')
-            .readLines()
-            .collect { it.trim().toUpperCase() }
-            .unique()
-
-          echo "FINAL active services: ${services}"
+          def services = fileExists('services.txt')
+            ? readFile('services.txt')
+                .readLines()
+                .collect { it.trim().toUpperCase() }
+                .findAll { it }
+                .unique()
+            : []
 
           def paramsList = []
 
-          // ✅ CORRECT SHOW / HIDE LOGIC
+          // ✅ REQUIRED BEHAVIOR
+          // When NO services → only kill Eureka
           if (services.isEmpty()) {
             paramsList << booleanParam(
               name: 'KILL_EUREKA',
               defaultValue: false,
               description: 'Kill Eureka Server'
             )
-          }
-
-          if (services == ['CONFIGSERVER']) {
-            paramsList << booleanParam(
-              name: 'KILL_CONFIGSERVER',
-              defaultValue: false,
-              description: 'Kill Config Server'
-            )
-          }
-
-          services.findAll { it != 'CONFIGSERVER' }.each { svc ->
-            paramsList << booleanParam(
-              name: "KILL_${svc}",
-              defaultValue: false,
-              description: "Kill ${svc}"
-            )
+          } else {
+            services.each { svc ->
+              paramsList << booleanParam(
+                name: "KILL_${svc}",
+                defaultValue: false,
+                description: "Kill ${svc}"
+              )
+            }
           }
 
           properties([
@@ -195,9 +188,7 @@ ForEach-Object {
              parameterDefinitions: paramsList]
           ])
 
-          echo "✅ Parameters generated correctly."
-          currentBuild.result = 'SUCCESS'
-          return
+          echo "✅ Parameters refreshed successfully"
         }
       }
     }
@@ -205,7 +196,7 @@ ForEach-Object {
 
   post {
     always {
-      echo "✅ KillInstances finished successfully."
+      echo "✅ KillInstances pipeline completed"
     }
   }
 }
