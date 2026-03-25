@@ -12,7 +12,8 @@ pipeline {
     stage('Clone EurekaServer Repo') {
       steps {
         dir('eureka') {
-          git url: 'https://github.com/Adrineel-Saha/EurekaServer.git', branch: 'main'
+          git url: 'https://github.com/Adrineel-Saha/EurekaServer.git',
+              branch: 'main'
         }
       }
     }
@@ -26,7 +27,7 @@ pipeline {
             error 'server.port not found in application.yml'
           }
           env.EUREKA_PORT = m.group(1)
-          echo "Eureka port resolved: ${env.EUREKA_PORT}"
+          echo "✅ Eureka port resolved: ${env.EUREKA_PORT}"
         }
       }
     }
@@ -35,6 +36,7 @@ pipeline {
       steps {
         bat '''
           curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
+          exit /b 0
         '''
       }
     }
@@ -43,7 +45,6 @@ pipeline {
       steps {
         script {
 
-          // ✅ PowerShell parses XML (NO XmlSlurper)
           writeFile file: 'resolve-targets.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 
@@ -89,6 +90,7 @@ ForEach-Object {
               taskkill /F /PID %%P >nul 2>&1 || echo PID %%P already stopped
             )
           )
+          exit /b 0
         '''
       }
     }
@@ -101,6 +103,7 @@ ForEach-Object {
             curl -s -X DELETE ^
               http://localhost:%EUREKA_PORT%/eureka/apps/%%A/%%B >nul 2>&1
           )
+          exit /b 0
         '''
       }
     }
@@ -116,11 +119,11 @@ ForEach-Object {
 
             bat '''
               curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml
+              exit /b 0
             '''
 
             writeFile file: 'extract-services.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
-
 $services = @()
 
 $x.applications.application |
@@ -140,7 +143,7 @@ $services | Set-Content "services.txt"
 
             if (services.isEmpty()) {
               writeFile file: 'services.txt', text: ''
-              echo 'Eureka registry is EMPTY'
+              echo '✅ Eureka registry is EMPTY'
               break
             }
 
@@ -163,10 +166,11 @@ $services | Set-Content "services.txt"
                 .unique()
             : []
 
+          echo "FINAL services: ${services}"
+
           def paramsList = []
 
           // ✅ REQUIRED BEHAVIOR
-          // When NO services → only kill Eureka
           if (services.isEmpty()) {
             paramsList << booleanParam(
               name: 'KILL_EUREKA',
@@ -188,7 +192,7 @@ $services | Set-Content "services.txt"
              parameterDefinitions: paramsList]
           ])
 
-          echo "✅ Parameters refreshed successfully"
+          echo "✅ Jenkins parameters refreshed"
         }
       }
     }
@@ -196,7 +200,7 @@ $services | Set-Content "services.txt"
 
   post {
     always {
-      echo "✅ KillInstances pipeline completed"
+      echo "✅ KillInstances pipeline finished"
     }
   }
 }
