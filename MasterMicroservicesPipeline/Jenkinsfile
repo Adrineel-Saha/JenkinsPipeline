@@ -1,46 +1,61 @@
 pipeline {
     agent any
 
+    parameters {
+        string(name: 'USER_EXTRA_PORTS',    defaultValue: '', description: 'UserService extra ports')
+        string(name: 'PRODUCT_EXTRA_PORTS', defaultValue: '', description: 'ProductService extra ports')
+        string(name: 'ORDER_EXTRA_PORTS',   defaultValue: '', description: 'OrderService extra ports')
+    }
+
     stages {
 
         stage('Run EurekaServer-Pipeline') {
             steps {
-                echo "Starting EurekaServer-Pipeline..."
                 build job: 'EurekaServer-Pipeline', wait: true, propagate: true
             }
         }
 
         stage('Run ConfigServer-Pipeline') {
             steps {
-                echo "Starting ConfigServer-Pipeline..."
                 build job: 'ConfigServer-Pipeline', wait: true, propagate: true
             }
         }
 
         stage('Run UserService-Pipeline') {
             steps {
-                echo "Starting UserService-Pipeline..."
-                build job: 'UserService-Pipeline', wait: true, propagate: true
+                build job: 'UserService-Pipeline',
+                      parameters: [
+                          string(name: 'EXTRA_PORTS', value: params.USER_EXTRA_PORTS)
+                      ],
+                      wait: true,
+                      propagate: true
             }
         }
 
         stage('Run ProductService-Pipeline') {
             steps {
-                echo "Starting ProductService-Pipeline..."
-                build job: 'ProductService-Pipeline', wait: true, propagate: true
+                build job: 'ProductService-Pipeline',
+                      parameters: [
+                          string(name: 'EXTRA_PORTS', value: params.PRODUCT_EXTRA_PORTS)
+                      ],
+                      wait: true,
+                      propagate: true
             }
         }
 
         stage('Run OrderService-Pipeline') {
             steps {
-                echo "Starting OrderService-Pipeline..."
-                build job: 'OrderService-Pipeline', wait: true, propagate: true
+                build job: 'OrderService-Pipeline',
+                      parameters: [
+                          string(name: 'EXTRA_PORTS', value: params.ORDER_EXTRA_PORTS)
+                      ],
+                      wait: true,
+                      propagate: true
             }
         }
-		
-		stage('Run ApiGateway-Pipeline') {
+
+        stage('Run ApiGateway-Pipeline') {
             steps {
-                echo "Starting ApiGateway-Pipeline..."
                 build job: 'ApiGateway-Pipeline', wait: true, propagate: true
             }
         }
@@ -48,7 +63,7 @@ pipeline {
 
     post {
         always {
-            echo "Master pipeline completed."
+            echo "✅ Master Microservices Pipeline completed."
         }
     }
 }
