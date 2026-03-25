@@ -2,8 +2,7 @@ pipeline {
   agent any
 
   parameters {
-    // Bootstrap param (will be replaced dynamically)
-    booleanParam(name: 'BOOTSTRAP', defaultValue: false, description: 'Bootstrap run')
+    booleanParam(name: 'BOOTSTRAP', defaultValue: false, description: 'Initial run')
   }
 
   stages {
@@ -18,155 +17,109 @@ pipeline {
       }
     }
 
-    stage('Read Eureka Port From application.yml') {
+    stage('Read Eureka Port') {
       steps {
         script {
           def yml = readFile 'src/main/resources/application.yml'
-          def m = (yml =~ /(?m)^server:\s*(?:\r?\n)\s*port:\s*(\d+)\s*$/)
-          if (!m.find()) {
-            error 'server.port not found in Eureka application.yml'
-          }
+          def m = (yml =~ /(?m)^server:\s*(?:\r?\n)\s*port:\s*(\d+)/)
+          if (!m.find()) error 'Eureka port missing'
           env.EUREKA_PORT = m.group(1)
-          echo "Eureka port = ${env.EUREKA_PORT}"
+          echo "Eureka Port = ${env.EUREKA_PORT}"
         }
       }
     }
 
-    stage('Discover Services From Eureka (XML) & Create Checkboxes') {
+    stage('Create Checkboxes From Eureka XML') {
       steps {
+        bat 'curl -s -H "Accept: application/xml" http://127.0.0.1:%EUREKA_PORT%/eureka/apps -o apps.xml'
+
+        bat '''
+        powershell -Command ^
+        "$xml=Get-Content apps.xml; ^
+         $apps=$xml.applications.application; ^
+         $apps.name | ForEach-Object { ^
+           'SVC_'+($_ -replace '[^A-Za-z0-9]','_').ToUpper()+'='+$_.ToLower() ^
+         } | Sort-Object -Unique" > svc_map.txt
+        '''
+
         script {
-          bat """
-            curl -s -H "Accept: application/xml" http://127.0.0.1:%EUREKA_PORT%/eureka/apps -o apps.xml
-          """
-
-          if (!fileExists('apps.xml')) {
-            error 'apps.xml not found'
-          }
-
-          def xml = new XmlSlurper().parse(new File('apps.xml'))
-
-          def serviceNames = [] as Set
-          xml.application.each { app ->
-            serviceNames << app.name.text().toLowerCase()
-          }
-
-          def paramsList = []
-          def mapping = []
-
-          serviceNames.sort().each { svc ->
-            def p = "SVC_" + svc.replaceAll('[^A-Za-z0-9]', '_').toUpperCase()
+          def paramsList=[]
+          readFile('svc_map.txt').readLines().each {
+            def (p, svc) = it.split('=')
             paramsList << [
               $class: 'BooleanParameterDefinition',
               name: p,
               defaultValue: false,
               description: "Kill service: ${svc}"
             ]
-            mapping << "${p}=${svc}"
           }
-
-          writeFile file: 'svc_map.txt', text: mapping.join('\n')
           properties([parameters(paramsList)])
-
-          echo "Checkboxes created from Eureka:"
-          paramsList.each { echo " - ${it.name}" }
         }
       }
     }
 
-    stage('Resolve Selected Services → Ports (XML)') {
-      steps {
-        script {
-          def selected = [] as Set
-
-          readFile('svc_map.txt').readLines().each { line ->
-            def (p, svc) = line.split('=')
-            if (params[p]) {
-              selected << svc
-            }
-          }
-
-          bat """
-            curl -s -H "Accept: application/xml" http://127.0.0.1:%EUREKA_PORT%/eureka/apps -o apps.xml
-          """
-
-          def xml = new XmlSlurper().parse(new File('apps.xml'))
-          def ports = [] as Set
-
-          xml.application.each { app ->
-            def name = app.name.text().toLowerCase()
-            if (selected.contains(name)) {
-              app.instance.each { inst ->
-                ports << inst.port.text()
-              }
-            }
-          }
-
-          env.PORTS_TO_KILL = ports.join(' ')
-          echo "Ports to kill = ${env.PORTS_TO_KILL}"
-        }
-      }
-    }
-
-    stage('Kill Selected Instances') {
-      when { expression { env.PORTS_TO_KILL?.trim() } }
+    stage('Resolve Ports From Eureka XML') {
       steps {
         bat '''
-          @echo on
-          for %%P in (%PORTS_TO_KILL%) do (
-            for /f "tokens=5" %%X in ('netstat -ano ^| findstr /r /c:":%%P .*LISTENING"') do (
-              echo Killing PID %%X on port %%P
-              taskkill /F /PID %%X >nul 2>&1
-            )
+        powershell -Command ^
+        "$xml=Get-Content apps.xml; ^
+         $ports=@(); ^
+         foreach($l in Get-Content svc_map.txt){ ^
+           $p,$svc=$l -split '='; ^
+           if($env:$p -eq 'true'){ ^
+             $xml.applications.application | Where-Object { $_.name.ToLower() -eq $svc } | ForEach-Object { ^
+               $_.instance | ForEach-Object { $ports += $_.port } ^
+             } ^
+           } ^
+         }; ^
+         $ports | Sort-Object -Unique" > ports.txt
+        '''
+
+        script {
+          env.PORTS_TO_KILL = readFile('ports.txt').trim()
+          echo "Ports to kill: ${env.PORTS_TO_KILL}"
+        }
+      }
+    }
+
+    stage('Kill Instances') {
+      when { expression { env.PORTS_TO_KILL } }
+      steps {
+        bat '''
+        for %%P in (%PORTS_TO_KILL%) do (
+          for /f "tokens=5" %%X in ('netstat -ano ^| findstr :%%P') do (
+            taskkill /F /PID %%X >nul 2>&1
           )
+        )
         '''
       }
     }
 
     stage('Deregister From Eureka') {
-      when { expression { env.PORTS_TO_KILL?.trim() } }
+      when { expression { env.PORTS_TO_KILL } }
       steps {
-        script {
-          bat """
-            curl -s -H "Accept: application/xml" http://127.0.0.1:%EUREKA_PORT%/eureka/apps -o apps.xml
-          """
-
-          def xml = new XmlSlurper().parse(new File('apps.xml'))
-
-          xml.application.each { app ->
-            app.instance.each { inst ->
-              def p = inst.port.text()
-              if (env.PORTS_TO_KILL.split(' ').contains(p)) {
-                def appName = app.name.text()
-                def iid = inst.instanceId.text()
-                bat """
-                  curl -s -X DELETE http://127.0.0.1:%EUREKA_PORT%/eureka/apps/${appName}/${iid}
-                """
-              }
-            }
-          }
-        }
+        bat '''
+        powershell -Command ^
+        "$xml=Get-Content apps.xml; ^
+         foreach($a in $xml.applications.application){ ^
+           foreach($i in $a.instance){ ^
+             if('%PORTS_TO_KILL%'.Split(' ') -contains $i.port){ ^
+               curl -s -X DELETE http://127.0.0.1:%EUREKA_PORT%/eureka/apps/$($a.name)/$($i.instanceId) ^
+             } ^
+           } ^
+         }"
+        '''
       }
     }
 
-    stage('Wait For Eureka Registry Update') {
-      steps {
-        echo 'Waiting 15 seconds for Eureka registry refresh...'
-        sleep time: 15, unit: 'SECONDS'
-      }
+    stage('Wait For Registry Update') {
+      steps { sleep time: 15, unit: 'SECONDS' }
     }
 
-    stage('Recreate Checkboxes For Next Build') {
+    stage('Refresh Checkboxes') {
       steps {
-        script {
-          build job: env.JOB_NAME, wait: false
-        }
+        script { build job: env.JOB_NAME, wait: false }
       }
-    }
-  }
-
-  post {
-    always {
-      echo "Pipeline finished. Use 'Build with Parameters' to see refreshed checkboxes."
     }
   }
 }
