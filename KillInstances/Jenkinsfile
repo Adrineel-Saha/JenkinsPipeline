@@ -135,4 +135,3 @@ $targets | Set-Content "targets.txt"
     }
   }
 }
-``
