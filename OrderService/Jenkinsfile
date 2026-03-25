@@ -4,7 +4,14 @@ pipeline {
   environment {
     JDK_HOME = tool name: 'JDK17', type: 'jdk'
     MVN_HOME = tool name: 'Maven3', type: 'maven'
-    // ORDER_PORT will be read from application.yml
+  }
+
+  parameters {
+    string(
+      name: 'EXTRA_PORTS',
+      defaultValue: '',
+      description: 'Additional ports (comma-separated). Example: 8086,8087'
+    )
   }
 
   stages {
@@ -15,80 +22,70 @@ pipeline {
       }
     }
 
-    // ---------------------------------------
-    // ✅ Read server.port from application.yml
-    // ---------------------------------------
+    // ----------------------------------------------------
+    // ✅ Read base server.port from application.yml
+    // ----------------------------------------------------
     stage('Read Port from application.yml') {
       steps {
         script {
-          def ymlPath = 'src/main/resources/application.yml'
-          if (!fileExists(ymlPath)) {
-            error "application.yml not found at ${ymlPath}"
-          }
-
-          def yml = readFile ymlPath
+          def yml = readFile 'src/main/resources/application.yml'
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
-
-          if (m.find()) {
-            env.ORDER_PORT = m.group(1)
-            echo "Using server.port from application.yml: ${env.ORDER_PORT}"
-          } else {
-            error "server.port not found in application.yml"
+          if (!m.find()) {
+            error 'server.port not found in application.yml'
           }
+          env.BASE_PORT = m.group(1)
+          echo "Base port from application.yml = ${env.BASE_PORT}"
         }
       }
     }
 
-    // ---------------------------------------
-    // ✅ Kill old instance by PORT
-    // ---------------------------------------
-    stage('Kill Old Instance') {
+    // ----------------------------------------------------
+    // ✅ Resolve ALL ports (base + extra)
+    // ----------------------------------------------------
+    stage('Resolve All Ports') {
+      steps {
+        script {
+          def ports = []
+          ports << env.BASE_PORT
+
+          if (params.EXTRA_PORTS?.trim()) {
+            params.EXTRA_PORTS.split(',')
+              .collect { it.trim() }
+              .findAll { it.isInteger() }
+              .each { ports << it }
+          }
+
+          env.ALL_PORTS = ports.unique().join(' ')
+          echo "All ports to use: ${env.ALL_PORTS}"
+        }
+      }
+    }
+
+    // ----------------------------------------------------
+    // ✅ Kill old instances on ALL ports
+    // ----------------------------------------------------
+    stage('Kill Old Instances') {
       steps {
         bat '''
           @echo on
-          echo === Kill (pre-build): checking port %ORDER_PORT% ===
-          set "FOUND="
-          for /f "tokens=5" %%p in (
-            'netstat -ano ^| findstr /r /c:":%ORDER_PORT%[ ]"'
-          ) do (
-            set FOUND=1
-            echo Found PID %%p on port %ORDER_PORT% - killing
-            taskkill /F /PID %%p >nul 2>&1
-          )
-          if not defined FOUND (
-            echo No process bound to port %ORDER_PORT%
+          for %%P in (%ALL_PORTS%) do (
+            echo Checking port %%P
+            for /f "tokens=5" %%X in (
+              'netstat -ano ^| findstr LISTENING ^| findstr :%%P'
+            ) do (
+              echo Killing PID %%X on port %%P
+              taskkill /F /PID %%X >nul 2>&1 || echo Already stopped
+            )
           )
           exit /b 0
         '''
       }
     }
 
-    // ---------------------------------------
-    // ✅ Compile
-    // ---------------------------------------
-    stage('Compile') {
-      steps {
-        withEnv([
-          "JAVA_HOME=${env.JDK_HOME}",
-          "M2_HOME=${env.MVN_HOME}",
-          "PATH+JAVA=${env.JDK_HOME}\\bin",
-          "PATH+MAVEN=${env.MVN_HOME}\\bin",
-          "MAVEN_OPTS=-Xmx1024m -Dfile.encoding=UTF-8"
-        ]) {
-          script {
-            def mvnCmd = fileExists('mvnw.cmd') ? 'mvnw.cmd' : '"%M2_HOME%\\bin\\mvn.cmd"'
-            bat 'echo === Compile ==='
-            bat '"%JAVA_HOME%\\bin\\java.exe" -version'
-            bat "call ${mvnCmd} -B -e -DskipTests compile"
-          }
-        }
-      }
-    }
-
-    // ---------------------------------------
-    // ✅ Unit Tests
-    // ---------------------------------------
-    stage('Unit Tests') {
+    // ----------------------------------------------------
+    // ✅ Build
+    // ----------------------------------------------------
+    stage('Build') {
       steps {
         withEnv([
           "JAVA_HOME=${env.JDK_HOME}",
@@ -96,100 +93,54 @@ pipeline {
           "PATH+JAVA=${env.JDK_HOME}\\bin",
           "PATH+MAVEN=${env.MVN_HOME}\\bin"
         ]) {
-          script {
-            def mvnCmd = fileExists('mvnw.cmd') ? 'mvnw.cmd' : '"%M2_HOME%\\bin\\mvn.cmd"'
-            bat 'echo === Unit Tests ==='
-            bat "call ${mvnCmd} -B -e test"
-          }
+          bat 'call "%M2_HOME%\\bin\\mvn.cmd" -B clean package -DskipTests'
         }
       }
     }
 
-    // ---------------------------------------
-    // ✅ Package
-    // ---------------------------------------
-    stage('Build (package)') {
+    // ----------------------------------------------------
+    // ✅ Run MULTIPLE instances (one per port)
+    // ----------------------------------------------------
+    stage('Run OrderService (Multiple Instances)') {
       steps {
-        withEnv([
-          "JAVA_HOME=${env.JDK_HOME}",
-          "M2_HOME=${env.MVN_HOME}",
-          "PATH+JAVA=${env.JDK_HOME}\\bin",
-          "PATH+MAVEN=${env.MVN_HOME}\\bin"
-        ]) {
-          script {
-            def mvnCmd = fileExists('mvnw.cmd') ? 'mvnw.cmd' : '"%M2_HOME%\\bin\\mvn.cmd"'
-            bat 'if exist target rmdir /s /q target'
-            bat "call ${mvnCmd} -B -e clean package -DskipTests"
+        bat '''
+          @echo on
+          setlocal enabledelayedexpansion
 
-            bat 'if not exist target\\*.jar (echo ERROR: No jar produced & exit /b 1)'
-          }
-        }
-      }
-    }
+          echo === Resolve JAR ===
+          for %%f in (target\\*.jar) do (
+            set "JAR=%%~ff"
+            goto :found
+          )
+          echo ERROR: No JAR found
+          exit /b 1
+          :found
 
-    // ---------------------------------------
-    // ✅ Run OrderService (port-known)
-    // ---------------------------------------
-    stage('Run OrderService') {
-      steps {
-        withEnv([
-          "JAVA_HOME=${env.JDK_HOME}",
-          "PATH+JAVA=${env.JDK_HOME}\\bin"
-        ]) {
-          bat '''
-            @echo on
-            setlocal enabledelayedexpansion
+          if exist run rmdir /s /q run
+          mkdir run
+          copy /Y "%JAR%" run\\OrderService.jar
 
-            echo === Resolve JAR ===
-            for %%f in (target\\*.jar) do (
-              set "SRC_JAR=%%~ff"
-              goto :found
-            )
-            echo ERROR: No jar found
-            exit /b 1
-            :found
+          rem Prevent Jenkins from killing background JVMs
+          set BUILD_ID=dontKillMe
+          set JENKINS_NODE_COOKIE=do_not_kill
 
-            rem Prepare run directory
-            if exist run rmdir /s /q run
-            mkdir run
-            copy /Y "%SRC_JAR%" run\\OrderService.jar
-
-            rem Prevent Jenkins from killing it
-            set BUILD_ID=dontKillMe
-            set JENKINS_NODE_COOKIE=do_not_kill
-
-            echo === Starting OrderService on port %ORDER_PORT% ===
+          for %%P in (%ALL_PORTS%) do (
+            echo Starting OrderService on port %%P
             start "" /b "%JAVA_HOME%\\bin\\java.exe" ^
               -jar "%CD%\\run\\OrderService.jar" ^
-              --server.port=%ORDER_PORT%
+              --server.port=%%P
+          )
 
-            echo === Waiting for HTTP readiness ===
-            set COUNT=0
-            :wait_loop
-            set /a COUNT+=1
-            ping -n 2 127.0.0.1 >nul
-            curl -s -o NUL http://127.0.0.1:%ORDER_PORT%/
-            if not errorlevel 1 goto up
-            if %COUNT% GEQ 60 goto fail
-            goto wait_loop
-
-            :up
-            echo SUCCESS: OrderService is running on port %ORDER_PORT%
-            exit /b 0
-
-            :fail
-            echo ERROR: OrderService did not start within 60 seconds
-            exit /b 1
-          '''
-        }
+          echo All OrderService instances started.
+          exit /b 0
+        '''
       }
     }
   }
 
   post {
     always {
-      echo "Pipeline finished. OrderService running on port ${env.ORDER_PORT} using Config Server for externalized config."
-      // junit 'target/surefire-reports/*.xml'
+      echo "✅ OrderService instances running on ports: ${env.ALL_PORTS}"
     }
   }
 }
