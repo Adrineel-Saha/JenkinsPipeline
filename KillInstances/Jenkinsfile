@@ -35,7 +35,7 @@ pipeline {
     }
 
     /* =========================================================
-       ✅ READ EUREKA PORT — WITH DIAGNOSTIC LOGS
+       READ EUREKA PORT (WITH LOGS)
        ========================================================= */
     stage('Read Eureka Port from application.yml') {
       steps {
@@ -53,15 +53,13 @@ pipeline {
           echo yml
           echo "📄 ===== application.yml END ====="
 
-          echo "🔍 Attempting to extract server.port using regex..."
           def m = (yml =~ /(?m)port:\s*(\d+)/)
-
           if (!m.find()) {
-            error "❌ Eureka server.port NOT FOUND in application.yml (regex match failed)"
+            error "❌ Eureka server.port NOT FOUND"
           }
 
           env.EUREKA_PORT = m.group(1)
-          echo "✅ Eureka port successfully resolved: ${env.EUREKA_PORT}"
+          echo "✅ Eureka port resolved: ${env.EUREKA_PORT}"
         }
       }
     }
@@ -110,28 +108,31 @@ pipeline {
     }
 
     /* =========================================================
-       DEREGISTER ONLY KILLED INSTANCES FROM EUREKA
+       DEREGISTER ONLY KILLED INSTANCES (FIXED)
        ========================================================= */
     stage('Deregister Microservices from Eureka') {
       steps {
         bat '''
-          powershell -NoProfile -Command "
-            [xml]$x = Get-Content 'apps.xml'
+          @echo on
+          echo Creating PowerShell deregistration script...
 
-            $ports = @()
-            if ('%USERSERVICE_PORTS%' -ne '') { $ports += '%USERSERVICE_PORTS%'.Split(',') }
-            if ('%PRODUCTSERVICE_PORTS%' -ne '') { $ports += '%PRODUCTSERVICE_PORTS%'.Split(',') }
-            if ('%ORDERSERVICE_PORTS%' -ne '') { $ports += '%ORDERSERVICE_PORTS%'.Split(',') }
+          (
+            echo [xml]$apps = Get-Content "apps.xml"
+            echo $ports = @()
+            echo if ("%USERSERVICE_PORTS%" -ne "") { $ports += "%USERSERVICE_PORTS%".Split(",") }
+            echo if ("%PRODUCTSERVICE_PORTS%" -ne "") { $ports += "%PRODUCTSERVICE_PORTS%".Split(",") }
+            echo if ("%ORDERSERVICE_PORTS%"  -ne "") { $ports += "%ORDERSERVICE_PORTS%".Split(",") }
+            echo foreach ($app in $apps.applications.application) {
+            echo   foreach ($inst in $app.instance) {
+            echo     if ($ports -contains $inst.port.'#text') {
+            echo       Write-Host "Deregistering $($app.name) : $($inst.instanceId)"
+            echo       curl -s -X DELETE http://localhost:%EUREKA_PORT%/eureka/apps/$($app.name)/$($inst.instanceId)
+            echo     }
+            echo   }
+            echo }
+          ) > deregister.ps1
 
-            foreach ($app in $x.applications.application) {
-              foreach ($inst in $app.instance) {
-                if ($ports -contains $inst.port.'#text') {
-                  Write-Host \"Deregistering $($app.name) : $($inst.instanceId)\"
-                  curl -s -X DELETE http://localhost:%EUREKA_PORT%/eureka/apps/$($app.name)/$($inst.instanceId)
-                }
-              }
-            }
-          "
+          powershell -NoProfile -ExecutionPolicy Bypass -File deregister.ps1
           exit /b 0
         '''
       }
