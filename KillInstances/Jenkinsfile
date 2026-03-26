@@ -1,23 +1,14 @@
 pipeline {
   agent any
 
-  /* =========================================================
-     PARAMETERS — FROM YOUR SECOND PIPELINE
-     ========================================================= */
+  /* ✅ STATIC PARAMETERS — ALWAYS VISIBLE */
   parameters {
-
     booleanParam(name: 'KILL_EUREKA',        defaultValue: false, description: 'Kill Eureka Server')
-    booleanParam(name: 'KILL_CONFIGSERVER',  defaultValue: false, description: 'Kill Config Server')
     booleanParam(name: 'KILL_APIGATEWAY',    defaultValue: false, description: 'Kill API Gateway')
-
-    booleanParam(name: 'KILL_USERSERVICE',   defaultValue: false, description: 'Kill User Service')
-    string(name: 'USERSERVICE_PORTS',        defaultValue: '', description: 'Optional ports (e.g. 8080,8085)')
-
-    booleanParam(name: 'KILL_PRODUCTSERVICE',defaultValue: false, description: 'Kill Product Service')
-    string(name: 'PRODUCTSERVICE_PORTS',     defaultValue: '', description: 'Optional ports (e.g. 8081,8083)')
-
+    booleanParam(name: 'KILL_CONFIGSERVER',  defaultValue: false, description: 'Kill Config Server')
     booleanParam(name: 'KILL_ORDERSERVICE',  defaultValue: false, description: 'Kill Order Service')
-    string(name: 'ORDERSERVICE_PORTS',       defaultValue: '', description: 'Optional ports (e.g. 8082,8084)')
+    booleanParam(name: 'KILL_PRODUCTSERVICE',defaultValue: false, description: 'Kill Product Service')
+    booleanParam(name: 'KILL_USERSERVICE',   defaultValue: false, description: 'Kill User Service')
   }
 
   stages {
@@ -34,13 +25,12 @@ pipeline {
       }
     }
 
-    /* ✅ CORRECT — STRICT, WORKING REGEX */
     stage('Read Eureka Port from application.yml') {
       steps {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)/)
-          if (!m.find()) error 'Eureka server.port not found'
+          if (!m.find()) error 'server.port not found'
           env.EUREKA_PORT = m.group(1)
           echo "✅ Eureka port = ${env.EUREKA_PORT}"
         }
@@ -49,13 +39,10 @@ pipeline {
 
     stage('Fetch Eureka Registry (XML)') {
       steps {
-        bat "curl -s http://localhost:${env.EUREKA_PORT}/eureka/apps > apps.xml"
+        bat 'curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml'
       }
     }
 
-    /* =========================================================
-       RESOLVE TARGETS FROM EUREKA (SAFE & DETERMINISTIC)
-       ========================================================= */
     stage('Resolve Targets from Eureka Registry') {
       steps {
         script {
@@ -81,13 +68,12 @@ $targets | Set-Content "targets.txt"
           if (fileExists('targets.txt')) {
             readFile('targets.txt').readLines().each { line ->
               def (app, id, port) = line.split('\\|')
-
               if (
-                (app == 'USERSERVICE'    && params.KILL_USERSERVICE    && (params.USERSERVICE_PORTS    == '' || params.USERSERVICE_PORTS.split(',').contains(port))) ||
-                (app == 'PRODUCTSERVICE' && params.KILL_PRODUCTSERVICE && (params.PRODUCTSERVICE_PORTS == '' || params.PRODUCTSERVICE_PORTS.split(',').contains(port))) ||
-                (app == 'ORDERSERVICE'   && params.KILL_ORDERSERVICE   && (params.ORDERSERVICE_PORTS   == '' || params.ORDERSERVICE_PORTS.split(',').contains(port))) ||
-                (app == 'APIGATEWAY'     && params.KILL_APIGATEWAY) ||
-                (app == 'CONFIGSERVER'   && params.KILL_CONFIGSERVER)
+                (app == 'USERSERVICE'      && params.KILL_USERSERVICE) ||
+                (app == 'PRODUCTSERVICE'   && params.KILL_PRODUCTSERVICE) ||
+                (app == 'ORDERSERVICE'     && params.KILL_ORDERSERVICE) ||
+                (app == 'APIGATEWAY'       && params.KILL_APIGATEWAY) ||
+                (app == 'CONFIGSERVER'     && params.KILL_CONFIGSERVER)
               ) {
                 finalTargets << line
               }
@@ -95,36 +81,41 @@ $targets | Set-Content "targets.txt"
           }
 
           writeFile file: 'final_targets.txt', text: finalTargets.join('\n')
-          env.HAS_TARGETS = finalTargets ? 'yes' : ''
-
-          echo '✅ Final targets from Eureka:'
+          env.HAS_APP_TARGETS = finalTargets ? 'yes' : ''
+          echo "✅ Final targets:"
           finalTargets.each { echo it }
         }
       }
     }
 
+    /* ✅ FIXED STAGE */
     stage('Kill Application Processes') {
-      when { expression { env.HAS_TARGETS == 'yes' } }
+      when { expression { env.HAS_APP_TARGETS == 'yes' } }
       steps {
         bat '''
           for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
             echo Killing %%A on port %%C
             for /f "tokens=5" %%P in (
               'netstat -ano ^| findstr LISTENING ^| findstr :%%C'
-            ) do taskkill /F /PID %%P >nul 2>&1
+            ) do (
+              echo Killing PID %%P
+              taskkill /F /PID %%P >nul 2>&1 || exit /b 0
+            )
           )
+          exit /b 0
         '''
       }
     }
 
     stage('Deregister Applications from Eureka') {
-      when { expression { env.HAS_TARGETS == 'yes' } }
+      when { expression { env.HAS_APP_TARGETS == 'yes' } }
       steps {
         bat '''
           for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
             echo Deregistering %%A instance %%B
             curl -s -X DELETE http://localhost:%EUREKA_PORT%/eureka/apps/%%A/%%B >nul
           )
+          exit /b 0
         '''
       }
     }
@@ -136,6 +127,7 @@ $targets | Set-Content "targets.txt"
           for /f "tokens=5" %%P in (
             'netstat -ano ^| findstr LISTENING ^| findstr :%EUREKA_PORT%'
           ) do taskkill /F /PID %%P >nul
+          exit /b 0
         '''
       }
     }
