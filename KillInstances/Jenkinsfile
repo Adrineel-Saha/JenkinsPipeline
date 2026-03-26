@@ -6,24 +6,24 @@ pipeline {
      ========================================================= */
   parameters {
 
-    booleanParam(name: 'KILL_EUREKA',        defaultValue: false, description: 'Kill Eureka Server')
-    booleanParam(name: 'KILL_CONFIGSERVER',  defaultValue: false, description: 'Kill Config Server (8888)')
-    booleanParam(name: 'KILL_APIGATEWAY',    defaultValue: false, description: 'Kill API Gateway (9191)')
+    booleanParam(name: 'KILL_EUREKA',         defaultValue: false, description: 'Kill Eureka Server')
+    booleanParam(name: 'KILL_CONFIGSERVER',   defaultValue: false, description: 'Kill Config Server (8888)')
+    booleanParam(name: 'KILL_APIGATEWAY',     defaultValue: false, description: 'Kill API Gateway (9191)')
 
-    booleanParam(name: 'KILL_USERSERVICE',   defaultValue: false, description: 'Kill UserService')
-    string(name: 'USERSERVICE_PORTS',        defaultValue: '',    description: 'e.g. 8080,8085')
+    booleanParam(name: 'KILL_USERSERVICE',    defaultValue: false, description: 'Kill UserService')
+    string(name: 'USERSERVICE_PORTS',         defaultValue: '',    description: 'e.g. 8080,8085')
 
-    booleanParam(name: 'KILL_PRODUCTSERVICE',defaultValue: false, description: 'Kill ProductService')
-    string(name: 'PRODUCTSERVICE_PORTS',     defaultValue: '',    description: 'e.g. 8081,8083')
+    booleanParam(name: 'KILL_PRODUCTSERVICE', defaultValue: false, description: 'Kill ProductService')
+    string(name: 'PRODUCTSERVICE_PORTS',      defaultValue: '',    description: 'e.g. 8081,8083')
 
-    booleanParam(name: 'KILL_ORDERSERVICE',  defaultValue: false, description: 'Kill OrderService')
-    string(name: 'ORDERSERVICE_PORTS',       defaultValue: '',    description: 'e.g. 8082')
+    booleanParam(name: 'KILL_ORDERSERVICE',   defaultValue: false, description: 'Kill OrderService')
+    string(name: 'ORDERSERVICE_PORTS',        defaultValue: '',    description: 'e.g. 8082')
   }
 
   stages {
 
     /* =========================================================
-       RESOLVE EUREKA PORT
+       RESOLVE EUREKA PORT (STRICT REGEX)
        ========================================================= */
     stage('Resolve Eureka Port') {
       steps {
@@ -33,15 +33,12 @@ pipeline {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
 
-          // ✅ REVERTED STRICT REGEX
+          // ✅ STRICT regex (as requested)
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)/)
-
-          if (!m.find()) {
-            error 'Eureka port not found'
-          }
+          if (!m.find()) error 'Eureka port not found'
 
           env.EUREKA_PORT = m.group(1)
-          echo "✅ Eureka port = ${env.EUREKA_PORT}"
+          echo "✅ Eureka port resolved = ${env.EUREKA_PORT}"
         }
       }
     }
@@ -53,12 +50,13 @@ pipeline {
     }
 
     /* =========================================================
-       KILL SERVICES — JAR + PORT, GRACEFUL THEN HARD
+       GRACEFUL-THEN-HARD KILL (JAR + PORT)
        ========================================================= */
     stage('Graceful Kill Services') {
       steps {
         bat '''
           @echo on
+          setlocal enabledelayedexpansion
 
           call :KILL UserService UserService.jar "%USERSERVICE_PORTS%" "%KILL_USERSERVICE%"
           call :KILL ProductService ProductService.jar "%PRODUCTSERVICE_PORTS%" "%KILL_PRODUCTSERVICE%"
@@ -77,9 +75,9 @@ pipeline {
           for %%P in (%PORTS:,= %) do (
             echo === %NAME% | Port %%P ===
 
-            for /f "tokens=2 delims== " %%X in ('
-              wmic process where "CommandLine like '%%!JAR!%%' and CommandLine like '%%--server.port=%%P%%'" get ProcessId /value
-            ') do (
+            for /f "tokens=2 delims== " %%X in (
+              'wmic process where "CommandLine like '%%%JAR%%%' and CommandLine like '%%%--server.port=%%P%%%' " get ProcessId /value'
+            ) do (
               echo Graceful stop PID %%X
               taskkill /PID %%X >nul 2>&1
               timeout /t 5 >nul
@@ -92,20 +90,25 @@ pipeline {
     }
 
     /* =========================================================
-       BEST‑EFFORT EUREKA CLEANUP
+       BEST-EFFORT EUREKA DEREGISTER (WINDOWS SAFE)
        ========================================================= */
     stage('Best Effort Eureka Deregister') {
       steps {
         bat '''
           @echo on
+          echo Creating PowerShell cleanup script...
 
           (
             echo [xml]$apps = Get-Content "apps.xml"
-            echo $ports = "%USERSERVICE_PORTS%,%PRODUCTSERVICE_PORTS%,%ORDERSERVICE_PORTS%".Split(',') ^| Where-Object { $_ -ne "" }
-            echo foreach ($a in $apps.applications.application) {
-            echo   foreach ($i in $a.instance) {
-            echo     if ($ports -contains $i.port.'#text') {
-            echo       curl -s -X DELETE http://localhost:%EUREKA_PORT%/eureka/apps/$($a.name)/$($i.instanceId)
+            echo $ports = @()
+            echo foreach ($p in "%USERSERVICE_PORTS%,%PRODUCTSERVICE_PORTS%,%ORDERSERVICE_PORTS%".Split(",")) {
+            echo   if ($p -ne "") { $ports += $p }
+            echo }
+            echo foreach ($app in $apps.applications.application) {
+            echo   foreach ($inst in $app.instance) {
+            echo     if ($ports -contains $inst.port.'#text') {
+            echo       Write-Host "DELETE $($app.name) / $($inst.instanceId)"
+            echo       curl -s -X DELETE http://localhost:%EUREKA_PORT%/eureka/apps/$($app.name)/$($inst.instanceId)
             echo     }
             echo   }
             echo }
@@ -140,7 +143,7 @@ pipeline {
 
   post {
     always {
-      echo '✅ KillInstances pipeline completed (graceful‑then‑hard strategy)'
+      echo '✅ KillInstances pipeline completed successfully'
     }
   }
 }
