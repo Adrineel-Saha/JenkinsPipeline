@@ -62,21 +62,22 @@ pipeline {
     }
 
     // ----------------------------------------------------
-    // ✅ Kill old instances on ALL ports
+    // ✅ SAFE FIX — Kill OrderService by JAR name (NOT by port)
     // ----------------------------------------------------
     stage('Kill Old Instances') {
       steps {
         bat '''
           @echo on
-          for %%P in (%ALL_PORTS%) do (
-            echo Checking port %%P
-            for /f "tokens=5" %%X in (
-              'netstat -ano ^| findstr LISTENING ^| findstr :%%P'
-            ) do (
-              echo Killing PID %%X on port %%P
-              taskkill /F /PID %%X >nul 2>&1 || echo Already stopped
-            )
+          echo === Killing existing OrderService instances by JAR name ===
+
+          for /f "skip=1 tokens=2 delims== " %%P in (
+            'wmic process where "CommandLine like '%%OrderService.jar%%'" get ProcessId /value'
+          ) do (
+            echo Killing OrderService PID %%P
+            taskkill /F /PID %%P >nul 2>&1
           )
+
+          echo === Kill stage completed ===
           exit /b 0
         '''
       }
