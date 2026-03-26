@@ -34,14 +34,34 @@ pipeline {
       }
     }
 
+    /* =========================================================
+       ✅ READ EUREKA PORT — WITH DIAGNOSTIC LOGS
+       ========================================================= */
     stage('Read Eureka Port from application.yml') {
       steps {
         script {
-          def yml = readFile('eureka/src/main/resources/application.yml')
-          def m = (yml =~ /(?m)^server:\\s*(?:\\r?\\n|\\r)\\s*port:\\s*(\\d+)/)
-          if (!m.find()) error 'Eureka server.port not found'
+          def ymlPath = 'eureka/src/main/resources/application.yml'
+          echo "🔍 Reading Eureka config from: ${ymlPath}"
+
+          if (!fileExists(ymlPath)) {
+            error "❌ application.yml not found at ${ymlPath}"
+          }
+
+          def yml = readFile(ymlPath)
+
+          echo "📄 ===== application.yml START ====="
+          echo yml
+          echo "📄 ===== application.yml END ====="
+
+          echo "🔍 Attempting to extract server.port using regex..."
+          def m = (yml =~ /(?m)port:\s*(\d+)/)
+
+          if (!m.find()) {
+            error "❌ Eureka server.port NOT FOUND in application.yml (regex match failed)"
+          }
+
           env.EUREKA_PORT = m.group(1)
-          echo "✅ Eureka port resolved: ${env.EUREKA_PORT}"
+          echo "✅ Eureka port successfully resolved: ${env.EUREKA_PORT}"
         }
       }
     }
