@@ -27,7 +27,7 @@ pipeline {
           }
 
           def yml = readFile ymlPath
-          def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
+          def m = (yml =~ /(?m)^server:\\s*(?:\\r?\\n|\\r)\\s*port:\\s*(\\d+)\\s*$/)
 
           if (m.find()) {
             env.GATEWAY_PORT = m.group(1)
@@ -40,24 +40,22 @@ pipeline {
     }
 
     // ---------------------------------------
-    // ✅ Kill old instance by PORT
+    // ✅ SAFE FIX — Kill ApiGateway by JAR name (NOT by port)
     // ---------------------------------------
     stage('Kill Old Instance') {
       steps {
         bat '''
           @echo on
-          echo === Kill (pre-build): checking port %GATEWAY_PORT% ===
-          set "FOUND="
-          for /f "tokens=5" %%p in (
-            'netstat -ano ^| findstr /r /c:":%GATEWAY_PORT%[ ]"'
+          echo === Killing existing ApiGateway instances by JAR name ===
+
+          for /f "skip=1 tokens=2 delims== " %%P in (
+            'wmic process where "CommandLine like '%%ApiGateway.jar%%'" get ProcessId /value'
           ) do (
-            set FOUND=1
-            echo Found PID %%p on port %GATEWAY_PORT% - killing
-            taskkill /F /PID %%p >nul 2>&1
+            echo Killing ApiGateway PID %%P
+            taskkill /F /PID %%P >nul 2>&1
           )
-          if not defined FOUND (
-            echo No process bound to port %GATEWAY_PORT%
-          )
+
+          echo === Kill stage completed ===
           exit /b 0
         '''
       }
@@ -115,7 +113,6 @@ pipeline {
             exit /b 1
             :found
 
-            rem Prepare run directory
             if exist run rmdir /s /q run
             mkdir run
             copy /Y "%SRC_JAR%" run\\ApiGateway.jar
@@ -154,8 +151,7 @@ pipeline {
 
   post {
     always {
-      echo "Pipeline finished. ApiGateway running on port ${env.GATEWAY_PORT} using Config Server for externalized config."
-      // junit 'target/surefire-reports/*.xml'
+      echo "✅ ApiGateway running in background on port ${env.GATEWAY_PORT}"
     }
   }
 }
