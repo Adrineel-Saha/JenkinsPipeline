@@ -32,8 +32,14 @@ pipeline {
         }
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
-          def m = (yml =~ /(?m)port:\\s*(\\d+)/)
-          if (!m.find()) error 'Eureka port not found'
+
+          // ✅ REVERTED STRICT REGEX
+          def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)/)
+
+          if (!m.find()) {
+            error 'Eureka port not found'
+          }
+
           env.EUREKA_PORT = m.group(1)
           echo "✅ Eureka port = ${env.EUREKA_PORT}"
         }
@@ -86,13 +92,12 @@ pipeline {
     }
 
     /* =========================================================
-       BEST‑EFFORT EUREKA CLEANUP (NOT REQUIRED FOR GRACEFUL)
+       BEST‑EFFORT EUREKA CLEANUP
        ========================================================= */
     stage('Best Effort Eureka Deregister') {
       steps {
         bat '''
           @echo on
-          echo Creating cleanup script...
 
           (
             echo [xml]$apps = Get-Content "apps.xml"
@@ -100,7 +105,6 @@ pipeline {
             echo foreach ($a in $apps.applications.application) {
             echo   foreach ($i in $a.instance) {
             echo     if ($ports -contains $i.port.'#text') {
-            echo       Write-Host "DELETE $($a.name) / $($i.instanceId)"
             echo       curl -s -X DELETE http://localhost:%EUREKA_PORT%/eureka/apps/$($a.name)/$($i.instanceId)
             echo     }
             echo   }
