@@ -1,25 +1,36 @@
 pipeline {
   agent any
 
+  /* =========================================================
+     PARAMETERS — FROM THE SECOND PIPELINE (AS REQUESTED)
+     ========================================================= */
   parameters {
 
-    booleanParam(name: 'KILL_EUREKA',         defaultValue: false, description: 'Kill Eureka Server')
-    booleanParam(name: 'KILL_CONFIGSERVER',   defaultValue: false, description: 'Kill Config Server (8888)')
-    booleanParam(name: 'KILL_APIGATEWAY',     defaultValue: false, description: 'Kill API Gateway (9191)')
+    // -------- Infrastructure --------
+    booleanParam(name: 'KILL_EUREKA',        defaultValue: false, description: 'Kill Eureka Server')
+    booleanParam(name: 'KILL_CONFIGSERVER',  defaultValue: false, description: 'Kill Config Server')
+    booleanParam(name: 'KILL_APIGATEWAY',    defaultValue: false, description: 'Kill API Gateway')
 
-    booleanParam(name: 'KILL_USERSERVICE',    defaultValue: false, description: 'Kill UserService')
-    string(name: 'USERSERVICE_PORTS',         defaultValue: '',    description: 'e.g. 8080,8085')
+    // -------- UserService --------
+    booleanParam(name: 'KILL_USERSERVICE',   defaultValue: false, description: 'Kill User Service')
+    string(name: 'USERSERVICE_PORTS',        defaultValue: '',    description: 'Optional ports (e.g. 8080,8085)')
 
-    booleanParam(name: 'KILL_PRODUCTSERVICE', defaultValue: false, description: 'Kill ProductService')
-    string(name: 'PRODUCTSERVICE_PORTS',      defaultValue: '',    description: 'e.g. 8081,8083')
+    // -------- ProductService --------
+    booleanParam(name: 'KILL_PRODUCTSERVICE',defaultValue: false, description: 'Kill Product Service')
+    string(name: 'PRODUCTSERVICE_PORTS',     defaultValue: '',    description: 'Optional ports (e.g. 8081,8083)')
 
-    booleanParam(name: 'KILL_ORDERSERVICE',   defaultValue: false, description: 'Kill OrderService')
-    string(name: 'ORDERSERVICE_PORTS',        defaultValue: '',    description: 'e.g. 8082,8084')
+    // -------- OrderService --------
+    booleanParam(name: 'KILL_ORDERSERVICE',  defaultValue: false, description: 'Kill Order Service')
+    string(name: 'ORDERSERVICE_PORTS',       defaultValue: '',    description: 'Optional ports (e.g. 8082,8084)')
   }
 
   stages {
 
-    stage('Clone Eureka Repo') {
+    stage('Clean Workspace') {
+      steps { deleteDir() }
+    }
+
+    stage('Clone EurekaServer Repo') {
       steps {
         dir('eureka') {
           git url: 'https://github.com/Adrineel-Saha/EurekaServer.git', branch: 'main'
@@ -27,87 +38,107 @@ pipeline {
       }
     }
 
-    stage('Read Eureka Port') {
+    stage('Read Eureka Port from application.yml') {
       steps {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
-          def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)/)
-          if (!m.find()) error 'Eureka port not found'
+          def m = (yml =~ /(?m)^server:\\s*(?:\\r?\\n|\\r)\\s*port:\\s*(\\d+)/)
+          if (!m.find()) error 'Eureka server.port not found'
           env.EUREKA_PORT = m.group(1)
           echo "✅ Eureka port = ${env.EUREKA_PORT}"
         }
       }
     }
 
-    stage('Fetch Eureka Registry') {
+    stage('Fetch Eureka Registry (XML)') {
       steps {
         bat "curl -s http://localhost:${env.EUREKA_PORT}/eureka/apps > apps.xml"
       }
     }
 
-    /* ✅ FIXED: parameter VALUE is passed */
-    stage('Kill Selected Microservices') {
+    /* =========================================================
+       RESOLVE TARGETS FROM EUREKA (CORRECT FIX)
+       ========================================================= */
+    stage('Resolve Targets from Eureka Registry') {
+      steps {
+        script {
+
+          writeFile file: 'resolve.ps1', text: """
+[xml]\$x = Get-Content 'apps.xml'
+\$targets = @()
+
+foreach (\$app in \$x.applications.application) {
+  foreach (\$inst in \$app.instance) {
+    if (\$inst.status -eq 'UP') {
+      \$targets += "\$($app.name)|\$($inst.instanceId)|\$($inst.port.'#text')"
+    }
+  }
+}
+
+\$targets | Set-Content 'targets.txt'
+"""
+          bat 'powershell -NoProfile -ExecutionPolicy Bypass -File resolve.ps1'
+
+          def finalTargets = []
+
+          if (fileExists('targets.txt')) {
+            readFile('targets.txt').readLines().each { line ->
+              def (app, id, port) = line.split('\\|')
+
+              if (
+                (app == 'USERSERVICE'      && params.KILL_USERSERVICE      && (params.USERSERVICE_PORTS == ''      || params.USERSERVICE_PORTS.split(',').contains(port))) ||
+                (app == 'PRODUCTSERVICE'   && params.KILL_PRODUCTSERVICE   && (params.PRODUCTSERVICE_PORTS == ''   || params.PRODUCTSERVICE_PORTS.split(',').contains(port))) ||
+                (app == 'ORDERSERVICE'     && params.KILL_ORDERSERVICE     && (params.ORDERSERVICE_PORTS == ''     || params.ORDERSERVICE_PORTS.split(',').contains(port))) ||
+                (app == 'APIGATEWAY'       && params.KILL_APIGATEWAY) ||
+                (app == 'CONFIGSERVER'     && params.KILL_CONFIGSERVER)
+              ) {
+                finalTargets << line
+              }
+            }
+          }
+
+          writeFile file: 'final_targets.txt', text: finalTargets.join('\n')
+          env.HAS_TARGETS = finalTargets ? 'yes' : ''
+
+          echo '✅ Final targets:'
+          finalTargets.each { echo it }
+        }
+      }
+    }
+
+    stage('Kill Application Processes') {
+      when { expression { env.HAS_TARGETS == 'yes' } }
       steps {
         bat '''
-          @echo on
-          call :kill "%KILL_USERSERVICE%" %USERSERVICE_PORTS%
-          call :kill "%KILL_PRODUCTSERVICE%" %PRODUCTSERVICE_PORTS%
-          call :kill "%KILL_ORDERSERVICE%" %ORDERSERVICE_PORTS%
-          exit /b 0
-
-          :kill
-          set FLAG=%1
-          set PORTS=%2
-
-          if not "%FLAG%"=="true" goto :eof
-          if "%PORTS%"=="" goto :eof
-
-          for %%P in (%PORTS:,= %) do (
-            echo Killing service on port %%P
-            for /f "tokens=5" %%X in (
-              'netstat -ano ^| findstr LISTENING ^| findstr :%%P'
-            ) do taskkill /F /PID %%X >nul 2>&1
+          for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
+            echo Killing %%A on port %%C
+            for /f "tokens=5" %%P in (
+              'netstat -ano ^| findstr LISTENING ^| findstr :%%C'
+            ) do taskkill /F /PID %%P >nul 2>&1
           )
-          goto :eof
         '''
       }
     }
 
-    /* ✅ FIXED: Windows‑safe PowerShell */
-    stage('Deregister Microservices from Eureka') {
+    stage('Deregister Applications from Eureka') {
+      when { expression { env.HAS_TARGETS == 'yes' } }
       steps {
-        powershell """
-          [xml]\$apps = Get-Content 'apps.xml'
-          \$ports = @()
-
-          foreach (\$p in '${USERSERVICE_PORTS},${PRODUCTSERVICE_PORTS},${ORDERSERVICE_PORTS}'.Split(',')) {
-            if (\$p -ne '') { \$ports += \$p }
-          }
-
-          foreach (\$app in \$apps.applications.application) {
-            foreach (\$inst in \$app.instance) {
-              if (\$ports -contains \$inst.port.'#text') {
-                Write-Host "DELETE \$($app.name) / \$($inst.instanceId)"
-                curl -s -X DELETE http://localhost:${EUREKA_PORT}/eureka/apps/\$($app.name)/\$($inst.instanceId)
-              }
-            }
-          }
-        """
+        bat '''
+          for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
+            echo Deregistering %%A instance %%B
+            curl -s -X DELETE http://localhost:%EUREKA_PORT%/eureka/apps/%%A/%%B >nul
+          )
+        '''
       }
     }
 
-    stage('Kill Infrastructure') {
+    stage('Kill Eureka Server') {
+      when { expression { params.KILL_EUREKA } }
       steps {
         bat '''
-          if "%KILL_CONFIGSERVER%"=="true" (
-            for /f "tokens=5" %%P in ('netstat -ano ^| findstr :8888') do taskkill /F /PID %%P >nul
-          )
-          if "%KILL_APIGATEWAY%"=="true" (
-            for /f "tokens=5" %%P in ('netstat -ano ^| findstr :9191') do taskkill /F /PID %%P >nul
-          )
-          if "%KILL_EUREKA%"=="true" (
-            for /f "tokens=5" %%P in ('netstat -ano ^| findstr :%EUREKA_PORT%') do taskkill /F /PID %%P >nul
-          )
+          for /f "tokens=5" %%P in (
+            'netstat -ano ^| findstr LISTENING ^| findstr :%EUREKA_PORT%'
+          ) do taskkill /F /PID %%P >nul
         '''
       }
     }
@@ -115,7 +146,7 @@ pipeline {
 
   post {
     always {
-      echo '✅ KillInstances pipeline finished successfully'
+      echo '✅ KillInstances pipeline completed successfully'
     }
   }
 }
