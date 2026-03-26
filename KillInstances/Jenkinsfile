@@ -2,26 +2,22 @@ pipeline {
   agent any
 
   /* =========================================================
-     PARAMETERS — FROM THE SECOND PIPELINE (AS REQUESTED)
+     PARAMETERS — FROM YOUR SECOND PIPELINE
      ========================================================= */
   parameters {
 
-    // -------- Infrastructure --------
     booleanParam(name: 'KILL_EUREKA',        defaultValue: false, description: 'Kill Eureka Server')
     booleanParam(name: 'KILL_CONFIGSERVER',  defaultValue: false, description: 'Kill Config Server')
     booleanParam(name: 'KILL_APIGATEWAY',    defaultValue: false, description: 'Kill API Gateway')
 
-    // -------- UserService --------
     booleanParam(name: 'KILL_USERSERVICE',   defaultValue: false, description: 'Kill User Service')
-    string(name: 'USERSERVICE_PORTS',        defaultValue: '',    description: 'Optional ports (e.g. 8080,8085)')
+    string(name: 'USERSERVICE_PORTS',        defaultValue: '', description: 'Optional ports (e.g. 8080,8085)')
 
-    // -------- ProductService --------
     booleanParam(name: 'KILL_PRODUCTSERVICE',defaultValue: false, description: 'Kill Product Service')
-    string(name: 'PRODUCTSERVICE_PORTS',     defaultValue: '',    description: 'Optional ports (e.g. 8081,8083)')
+    string(name: 'PRODUCTSERVICE_PORTS',     defaultValue: '', description: 'Optional ports (e.g. 8081,8083)')
 
-    // -------- OrderService --------
     booleanParam(name: 'KILL_ORDERSERVICE',  defaultValue: false, description: 'Kill Order Service')
-    string(name: 'ORDERSERVICE_PORTS',       defaultValue: '',    description: 'Optional ports (e.g. 8082,8084)')
+    string(name: 'ORDERSERVICE_PORTS',       defaultValue: '', description: 'Optional ports (e.g. 8082,8084)')
   }
 
   stages {
@@ -38,11 +34,12 @@ pipeline {
       }
     }
 
+    /* ✅ CORRECT — STRICT, WORKING REGEX */
     stage('Read Eureka Port from application.yml') {
       steps {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
-          def m = (yml =~ /(?m)^server:\\s*(?:\\r?\\n|\\r)\\s*port:\\s*(\\d+)/)
+          def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)/)
           if (!m.find()) error 'Eureka server.port not found'
           env.EUREKA_PORT = m.group(1)
           echo "✅ Eureka port = ${env.EUREKA_PORT}"
@@ -57,26 +54,26 @@ pipeline {
     }
 
     /* =========================================================
-       RESOLVE TARGETS FROM EUREKA (CORRECT FIX)
+       RESOLVE TARGETS FROM EUREKA (SAFE & DETERMINISTIC)
        ========================================================= */
     stage('Resolve Targets from Eureka Registry') {
       steps {
         script {
 
-          writeFile file: 'resolve.ps1', text: """
-[xml]\$x = Get-Content 'apps.xml'
-\$targets = @()
+          writeFile file: 'resolve.ps1', text: '''
+[xml]$x = Get-Content "apps.xml"
+$targets = @()
 
-foreach (\$app in \$x.applications.application) {
-  foreach (\$inst in \$app.instance) {
-    if (\$inst.status -eq 'UP') {
-      \$targets += "\$($app.name)|\$($inst.instanceId)|\$($inst.port.'#text')"
+foreach ($app in $x.applications.application) {
+  foreach ($inst in $app.instance) {
+    if ($inst.status -eq "UP") {
+      $targets += "$($app.name)|$($inst.instanceId)|$($inst.port.'#text')"
     }
   }
 }
 
-\$targets | Set-Content 'targets.txt'
-"""
+$targets | Set-Content "targets.txt"
+'''
           bat 'powershell -NoProfile -ExecutionPolicy Bypass -File resolve.ps1'
 
           def finalTargets = []
@@ -86,11 +83,11 @@ foreach (\$app in \$x.applications.application) {
               def (app, id, port) = line.split('\\|')
 
               if (
-                (app == 'USERSERVICE'      && params.KILL_USERSERVICE      && (params.USERSERVICE_PORTS == ''      || params.USERSERVICE_PORTS.split(',').contains(port))) ||
-                (app == 'PRODUCTSERVICE'   && params.KILL_PRODUCTSERVICE   && (params.PRODUCTSERVICE_PORTS == ''   || params.PRODUCTSERVICE_PORTS.split(',').contains(port))) ||
-                (app == 'ORDERSERVICE'     && params.KILL_ORDERSERVICE     && (params.ORDERSERVICE_PORTS == ''     || params.ORDERSERVICE_PORTS.split(',').contains(port))) ||
-                (app == 'APIGATEWAY'       && params.KILL_APIGATEWAY) ||
-                (app == 'CONFIGSERVER'     && params.KILL_CONFIGSERVER)
+                (app == 'USERSERVICE'    && params.KILL_USERSERVICE    && (params.USERSERVICE_PORTS    == '' || params.USERSERVICE_PORTS.split(',').contains(port))) ||
+                (app == 'PRODUCTSERVICE' && params.KILL_PRODUCTSERVICE && (params.PRODUCTSERVICE_PORTS == '' || params.PRODUCTSERVICE_PORTS.split(',').contains(port))) ||
+                (app == 'ORDERSERVICE'   && params.KILL_ORDERSERVICE   && (params.ORDERSERVICE_PORTS   == '' || params.ORDERSERVICE_PORTS.split(',').contains(port))) ||
+                (app == 'APIGATEWAY'     && params.KILL_APIGATEWAY) ||
+                (app == 'CONFIGSERVER'   && params.KILL_CONFIGSERVER)
               ) {
                 finalTargets << line
               }
@@ -100,7 +97,7 @@ foreach (\$app in \$x.applications.application) {
           writeFile file: 'final_targets.txt', text: finalTargets.join('\n')
           env.HAS_TARGETS = finalTargets ? 'yes' : ''
 
-          echo '✅ Final targets:'
+          echo '✅ Final targets from Eureka:'
           finalTargets.each { echo it }
         }
       }
