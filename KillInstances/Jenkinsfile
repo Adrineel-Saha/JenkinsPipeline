@@ -1,9 +1,6 @@
 pipeline {
   agent any
 
-  /* =========================================================
-     PARAMETERS
-     ========================================================= */
   parameters {
 
     booleanParam(name: 'KILL_EUREKA',         defaultValue: false, description: 'Kill Eureka Server')
@@ -17,112 +14,88 @@ pipeline {
     string(name: 'PRODUCTSERVICE_PORTS',      defaultValue: '',    description: 'e.g. 8081,8083')
 
     booleanParam(name: 'KILL_ORDERSERVICE',   defaultValue: false, description: 'Kill OrderService')
-    string(name: 'ORDERSERVICE_PORTS',        defaultValue: '',    description: 'e.g. 8082')
+    string(name: 'ORDERSERVICE_PORTS',        defaultValue: '',    description: 'e.g. 8082,8084')
   }
 
   stages {
 
-    /* =========================================================
-       RESOLVE EUREKA PORT (STRICT REGEX)
-       ========================================================= */
-    stage('Resolve Eureka Port') {
+    stage('Clone Eureka Repo') {
       steps {
         dir('eureka') {
           git url: 'https://github.com/Adrineel-Saha/EurekaServer.git', branch: 'main'
         }
+      }
+    }
+
+    stage('Read Eureka Port') {
+      steps {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
-
-          // ✅ STRICT regex (as requested)
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)/)
           if (!m.find()) error 'Eureka port not found'
-
           env.EUREKA_PORT = m.group(1)
-          echo "✅ Eureka port resolved = ${env.EUREKA_PORT}"
+          echo "✅ Eureka port = ${env.EUREKA_PORT}"
         }
       }
     }
 
     stage('Fetch Eureka Registry') {
       steps {
-        bat "curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml"
+        bat "curl -s http://localhost:${env.EUREKA_PORT}/eureka/apps > apps.xml"
       }
     }
 
-    /* =========================================================
-       GRACEFUL-THEN-HARD KILL (JAR + PORT)
-       ========================================================= */
-    stage('Graceful Kill Services') {
+    /* ✅ FIXED: parameter VALUE is passed */
+    stage('Kill Selected Microservices') {
       steps {
         bat '''
           @echo on
-          setlocal enabledelayedexpansion
-
-          call :KILL UserService UserService.jar "%USERSERVICE_PORTS%" "%KILL_USERSERVICE%"
-          call :KILL ProductService ProductService.jar "%PRODUCTSERVICE_PORTS%" "%KILL_PRODUCTSERVICE%"
-          call :KILL OrderService OrderService.jar "%ORDERSERVICE_PORTS%" "%KILL_ORDERSERVICE%"
+          call :kill "%KILL_USERSERVICE%" %USERSERVICE_PORTS%
+          call :kill "%KILL_PRODUCTSERVICE%" %PRODUCTSERVICE_PORTS%
+          call :kill "%KILL_ORDERSERVICE%" %ORDERSERVICE_PORTS%
           exit /b 0
 
-          :KILL
-          set NAME=%1
-          set JAR=%2
-          set PORTS=%3
-          set ENABLED=%4
+          :kill
+          set FLAG=%1
+          set PORTS=%2
 
-          if not "%ENABLED%"=="true" goto :eof
+          if not "%FLAG%"=="true" goto :eof
           if "%PORTS%"=="" goto :eof
 
           for %%P in (%PORTS:,= %) do (
-            echo === %NAME% | Port %%P ===
-
-            for /f "tokens=2 delims== " %%X in (
-              'wmic process where "CommandLine like '%%%JAR%%%' and CommandLine like '%%%--server.port=%%P%%%' " get ProcessId /value'
-            ) do (
-              echo Graceful stop PID %%X
-              taskkill /PID %%X >nul 2>&1
-              timeout /t 5 >nul
-              taskkill /F /PID %%X >nul 2>&1
-            )
+            echo Killing service on port %%P
+            for /f "tokens=5" %%X in (
+              'netstat -ano ^| findstr LISTENING ^| findstr :%%P'
+            ) do taskkill /F /PID %%X >nul 2>&1
           )
           goto :eof
         '''
       }
     }
 
-    /* =========================================================
-       BEST-EFFORT EUREKA DEREGISTER (WINDOWS SAFE)
-       ========================================================= */
-    stage('Best Effort Eureka Deregister') {
+    /* ✅ FIXED: Windows‑safe PowerShell */
+    stage('Deregister Microservices from Eureka') {
       steps {
-        bat '''
-          @echo on
-          echo Creating PowerShell cleanup script...
+        powershell """
+          [xml]\$apps = Get-Content 'apps.xml'
+          \$ports = @()
 
-          (
-            echo [xml]$apps = Get-Content "apps.xml"
-            echo $ports = @()
-            echo foreach ($p in "%USERSERVICE_PORTS%,%PRODUCTSERVICE_PORTS%,%ORDERSERVICE_PORTS%".Split(",")) {
-            echo   if ($p -ne "") { $ports += $p }
-            echo }
-            echo foreach ($app in $apps.applications.application) {
-            echo   foreach ($inst in $app.instance) {
-            echo     if ($ports -contains $inst.port.'#text') {
-            echo       Write-Host "DELETE $($app.name) / $($inst.instanceId)"
-            echo       curl -s -X DELETE http://localhost:%EUREKA_PORT%/eureka/apps/$($app.name)/$($inst.instanceId)
-            echo     }
-            echo   }
-            echo }
-          ) > cleanup.ps1
+          foreach (\$p in '${USERSERVICE_PORTS},${PRODUCTSERVICE_PORTS},${ORDERSERVICE_PORTS}'.Split(',')) {
+            if (\$p -ne '') { \$ports += \$p }
+          }
 
-          powershell -NoProfile -ExecutionPolicy Bypass -File cleanup.ps1
-          exit /b 0
-        '''
+          foreach (\$app in \$apps.applications.application) {
+            foreach (\$inst in \$app.instance) {
+              if (\$ports -contains \$inst.port.'#text') {
+                Write-Host "DELETE \$($app.name) / \$($inst.instanceId)"
+                curl -s -X DELETE http://localhost:${EUREKA_PORT}/eureka/apps/\$($app.name)/\$($inst.instanceId)
+              }
+            }
+          }
+        """
       }
     }
 
-    /* =========================================================
-       INFRASTRUCTURE
-       ========================================================= */
     stage('Kill Infrastructure') {
       steps {
         bat '''
@@ -135,7 +108,6 @@ pipeline {
           if "%KILL_EUREKA%"=="true" (
             for /f "tokens=5" %%P in ('netstat -ano ^| findstr :%EUREKA_PORT%') do taskkill /F /PID %%P >nul
           )
-          exit /b 0
         '''
       }
     }
@@ -143,7 +115,7 @@ pipeline {
 
   post {
     always {
-      echo '✅ KillInstances pipeline completed successfully'
+      echo '✅ KillInstances pipeline finished successfully'
     }
   }
 }
