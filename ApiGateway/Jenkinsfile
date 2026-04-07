@@ -27,7 +27,7 @@ pipeline {
           }
 
           def yml = readFile ymlPath
-          def m = (yml =~ /(?m)^server:\\s*(?:\\r?\\n|\\r)\\s*port:\\s*(\\d+)\\s*$/)
+          def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
 
           if (m.find()) {
             env.GATEWAY_PORT = m.group(1)
