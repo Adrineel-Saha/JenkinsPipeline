@@ -1,11 +1,17 @@
 pipeline {
   agent any
 
+  /* =========================================================
+     PARAMETERS
+     ========================================================= */
   parameters {
 
-    booleanParam(name: 'KILL_EUREKA', defaultValue: false, description: 'Kill Eureka Server')
-    booleanParam(name: 'KILL_APIGATEWAY', defaultValue: false, description: 'Kill API Gateway')
-    booleanParam(name: 'KILL_CONFIGSERVER', defaultValue: false, description: 'Kill Config Server')
+    /* ---------- Infrastructure / single instance ---------- */
+    booleanParam(name: 'KILL_EUREKA',        defaultValue: false, description: 'Kill Eureka Server')
+    booleanParam(name: 'KILL_APIGATEWAY',    defaultValue: false, description: 'Kill API Gateway')
+    booleanParam(name: 'KILL_CONFIGSERVER',  defaultValue: false, description: 'Kill Config Server')
+
+    /* ---------- Microservices (with ports) ---------- */
 
     booleanParam(name: 'KILL_USERSERVICE', defaultValue: false, description: 'Kill User Service')
     string(name: 'USERSERVICE_PORTS', defaultValue: '', description: 'UserService ports (comma-separated). Empty = ALL')
@@ -19,10 +25,14 @@ pipeline {
 
   stages {
 
+    /* ========================================================= */
     stage('Clean Workspace') {
-      steps { deleteDir() }
+      steps {
+        deleteDir()
+      }
     }
 
+    /* ========================================================= */
     stage('Clone EurekaServer Repo') {
       steps {
         dir('eureka') {
@@ -31,42 +41,53 @@ pipeline {
       }
     }
 
+    /* ========================================================= */
     stage('Read Eureka Port from application.yml') {
       steps {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)/)
-          if (!m.find()) error 'server.port not found'
+          if (!m.find()) {
+            error 'server.port not found in Eureka application.yml'
+          }
           env.EUREKA_PORT = m.group(1)
           echo "✅ Eureka port = ${env.EUREKA_PORT}"
         }
       }
     }
 
+    /* ========================================================= */
     stage('Fetch Eureka Registry (XML)') {
       steps {
         bat 'curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml'
       }
     }
 
+    /* ========================================================= */
     stage('Resolve Targets from Eureka Registry') {
       steps {
         script {
 
+          /* Ports only for microservices */
           def portMap = [
             USERSERVICE    : params.USERSERVICE_PORTS,
             PRODUCTSERVICE : params.PRODUCTSERVICE_PORTS,
             ORDERSERVICE   : params.ORDERSERVICE_PORTS
           ]
 
+          /* Always create targets.txt (even if empty) */
+          writeFile file: 'targets.txt', text: ''
+
           writeFile file: 'resolve.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 $targets = @()
 
-foreach ($app in $x.applications.application) {
-  foreach ($inst in $app.instance) {
-    if ($inst.status -eq "UP") {
-      $targets += "$($app.name)|$($inst.instanceId)|$($inst.port.'#text')"
+if ($x.applications -and $x.applications.application) {
+  foreach ($app in $x.applications.application) {
+    foreach ($inst in $app.instance) {
+      if ($inst.status -eq "UP") {
+        $targets += "$($app.name)|$($inst.instanceId)|$($inst.port.'#text')"
+      }
     }
   }
 }
@@ -77,37 +98,42 @@ $targets | Set-Content "targets.txt"
 
           def finalTargets = []
 
-          readFile('targets.txt').readLines().each { line ->
-            def (app, id, port) = line.split('\\|')
+          if (fileExists('targets.txt')) {
+            readFile('targets.txt').readLines().each { line ->
+              if (!line?.trim()) return
 
-            def killEnabled =
-              (app == 'USERSERVICE'      && params.KILL_USERSERVICE) ||
-              (app == 'PRODUCTSERVICE'   && params.KILL_PRODUCTSERVICE) ||
-              (app == 'ORDERSERVICE'     && params.KILL_ORDERSERVICE) ||
-              (app == 'APIGATEWAY'       && params.KILL_APIGATEWAY) ||
-              (app == 'CONFIGSERVER'     && params.KILL_CONFIGSERVER)
+              def (app, id, port) = line.split('\\|')
 
-            if (!killEnabled) return
+              /* Checkbox check */
+              def killEnabled =
+                (app == 'USERSERVICE'      && params.KILL_USERSERVICE) ||
+                (app == 'PRODUCTSERVICE'   && params.KILL_PRODUCTSERVICE) ||
+                (app == 'ORDERSERVICE'     && params.KILL_ORDERSERVICE) ||
+                (app == 'APIGATEWAY'       && params.KILL_APIGATEWAY) ||
+                (app == 'CONFIGSERVER'     && params.KILL_CONFIGSERVER)
 
-            /* Non‑port services */
-            if (!portMap.containsKey(app)) {
-              finalTargets << line
-              return
-            }
+              if (!killEnabled) return
 
-            /* CPS‑SAFE port handling */
-            def selectedPorts = []
-            if (portMap[app]?.trim()) {
-              selectedPorts = portMap[app]
-                .split(',')
-                .collect { it.trim() }
-                .findAll { it.isInteger() }
-            }
+              /* Services without ports */
+              if (!portMap.containsKey(app)) {
+                finalTargets << line
+                return
+              }
 
-            if (!selectedPorts || selectedPorts.isEmpty()) {
-              finalTargets << line
-            } else if (selectedPorts.contains(port)) {
-              finalTargets << line
+              /* CPS‑safe port parsing */
+              def selectedPorts = []
+              if (portMap[app]?.trim()) {
+                selectedPorts = portMap[app]
+                  .split(',')
+                  .collect { it.trim() }
+                  .findAll { it.isInteger() }
+              }
+
+              if (!selectedPorts || selectedPorts.isEmpty()) {
+                finalTargets << line
+              } else if (selectedPorts.contains(port)) {
+                finalTargets << line
+              }
             }
           }
 
@@ -115,16 +141,22 @@ $targets | Set-Content "targets.txt"
           env.HAS_APP_TARGETS = finalTargets ? 'yes' : ''
 
           echo '✅ Final targets:'
-          finalTargets.each { echo it }
+          if (finalTargets.isEmpty()) {
+            echo 'No application instances selected (valid state)'
+          } else {
+            finalTargets.each { echo it }
+          }
         }
       }
     }
 
+    /* ========================================================= */
     stage('Kill Application Processes') {
       when { expression { env.HAS_APP_TARGETS == 'yes' } }
       steps {
         bat '''
           for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
+            echo Killing %%A on port %%C
             for /f "tokens=5" %%P in (
               'netstat -ano ^| findstr LISTENING ^| findstr :%%C'
             ) do (
@@ -136,11 +168,13 @@ $targets | Set-Content "targets.txt"
       }
     }
 
+    /* ========================================================= */
     stage('Deregister Applications from Eureka') {
       when { expression { env.HAS_APP_TARGETS == 'yes' } }
       steps {
         bat '''
           for /f "tokens=1,2,3 delims=|" %%A in (final_targets.txt) do (
+            echo Deregistering %%A instance %%B
             curl -s -X DELETE http://localhost:%EUREKA_PORT%/eureka/apps/%%A/%%B >nul
           )
           exit /b 0
@@ -148,13 +182,17 @@ $targets | Set-Content "targets.txt"
       }
     }
 
+    /* ========================================================= */
     stage('Kill Eureka Server') {
       when { expression { params.KILL_EUREKA } }
       steps {
         bat '''
+          echo Killing Eureka Server on port %EUREKA_PORT%
           for /f "tokens=5" %%P in (
             'netstat -ano ^| findstr LISTENING ^| findstr :%EUREKA_PORT%'
-          ) do taskkill /F /PID %%P >nul
+          ) do (
+            taskkill /F /PID %%P >nul
+          )
           exit /b 0
         '''
       }
