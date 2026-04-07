@@ -16,15 +16,14 @@ pipeline {
 
   stages {
 
+    // ====================================================
     stage('Clone Repository') {
       steps {
         git url: 'https://github.com/Adrineel-Saha/OrderService.git', branch: 'main'
       }
     }
 
-    // ----------------------------------------------------
-    // ✅ Read base server.port from application.yml
-    // ----------------------------------------------------
+    // ====================================================
     stage('Read Port from application.yml') {
       steps {
         script {
@@ -39,9 +38,7 @@ pipeline {
       }
     }
 
-    // ----------------------------------------------------
-    // ✅ Resolve ALL ports (base + extra)
-    // ----------------------------------------------------
+    // ====================================================
     stage('Resolve All Ports') {
       steps {
         script {
@@ -61,32 +58,29 @@ pipeline {
       }
     }
 
-    // ----------------------------------------------------
-    // ✅ SAFE FIX — Kill OrderService by JAR name (NOT by port)
-    // ----------------------------------------------------
+    // ====================================================
     stage('Kill Old Instances') {
       steps {
         bat '''
           @echo on
-          echo === Killing existing OrderService instances by JAR name ===
+          echo === Killing existing OrderService instances ===
 
           for /f "skip=1 tokens=2 delims== " %%P in (
             'wmic process where "CommandLine like '%%OrderService.jar%%'" get ProcessId /value'
           ) do (
-            echo Killing OrderService PID %%P
             taskkill /F /PID %%P >nul 2>&1
           )
 
-          echo === Kill stage completed ===
           exit /b 0
         '''
       }
     }
 
-    // ----------------------------------------------------
-    // ✅ Build
-    // ----------------------------------------------------
-    stage('Build') {
+    // =======================
+    // ✅ CI PIPELINE STAGES
+    // =======================
+
+    stage('Compile') {
       steps {
         withEnv([
           "JAVA_HOME=${env.JDK_HOME}",
@@ -94,27 +88,63 @@ pipeline {
           "PATH+JAVA=${env.JDK_HOME}\\bin",
           "PATH+MAVEN=${env.MVN_HOME}\\bin"
         ]) {
-          bat 'call "%M2_HOME%\\bin\\mvn.cmd" -B clean package -DskipTests'
+          bat 'call "%M2_HOME%\\bin\\mvn.cmd" -B clean compile'
         }
       }
     }
 
-    // ----------------------------------------------------
-    // ✅ Run MULTIPLE instances (one per port)
-    // ----------------------------------------------------
+    stage('Unit Tests') {
+      steps {
+        withEnv([
+          "JAVA_HOME=${env.JDK_HOME}",
+          "M2_HOME=${env.MVN_HOME}",
+          "PATH+JAVA=${env.JDK_HOME}\\bin",
+          "PATH+MAVEN=${env.MVN_HOME}\\bin"
+        ]) {
+          bat 'call "%M2_HOME%\\bin\\mvn.cmd" -B test'
+        }
+      }
+    }
+
+    stage('SonarQube Scan') {
+      steps {
+        withSonarQubeEnv('SonarQube') {
+          withEnv([
+            "JAVA_HOME=${env.JDK_HOME}",
+            "M2_HOME=${env.MVN_HOME}",
+            "PATH+JAVA=${env.JDK_HOME}\\bin",
+            "PATH+MAVEN=${env.MVN_HOME}\\bin"
+          ]) {
+            bat 'call "%M2_HOME%\\bin\\mvn.cmd" -B verify sonar:sonar'
+          }
+        }
+      }
+    }
+
+    stage('Package / Build') {
+      steps {
+        withEnv([
+          "JAVA_HOME=${env.JDK_HOME}",
+          "M2_HOME=${env.MVN_HOME}",
+          "PATH+JAVA=${env.JDK_HOME}\\bin",
+          "PATH+MAVEN=${env.MVN_HOME}\\bin"
+        ]) {
+          bat 'call "%M2_HOME%\\bin\\mvn.cmd" -B package -DskipTests'
+        }
+      }
+    }
+
+    // ====================================================
     stage('Run OrderService (Multiple Instances)') {
       steps {
         bat '''
           @echo on
           setlocal enabledelayedexpansion
 
-          echo === Resolve JAR ===
           for %%f in (target\\*.jar) do (
             set "JAR=%%~ff"
             goto :found
           )
-          echo ERROR: No JAR found
-          exit /b 1
           :found
 
           if exist run rmdir /s /q run
@@ -132,7 +162,6 @@ pipeline {
               --server.port=%%P
           )
 
-          echo All OrderService instances started.
           exit /b 0
         '''
       }
