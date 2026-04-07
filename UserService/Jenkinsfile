@@ -22,9 +22,6 @@ pipeline {
       }
     }
 
-    // ----------------------------------------------------
-    // ✅ Read base server.port from application.yml
-    // ----------------------------------------------------
     stage('Read Port from application.yml') {
       steps {
         script {
@@ -39,9 +36,6 @@ pipeline {
       }
     }
 
-    // ----------------------------------------------------
-    // ✅ Resolve ALL ports (base + extra)
-    // ----------------------------------------------------
     stage('Resolve All Ports') {
       steps {
         script {
@@ -61,32 +55,25 @@ pipeline {
       }
     }
 
-    // ----------------------------------------------------
-    // ✅ SAFE FIX — Kill UserService by JAR name (NOT by port)
-    // ----------------------------------------------------
     stage('Kill Old Instances') {
       steps {
         bat '''
           @echo on
-          echo === Killing existing UserService instances by JAR name ===
-
           for /f "skip=1 tokens=2 delims== " %%P in (
             'wmic process where "CommandLine like '%%UserService.jar%%'" get ProcessId /value'
           ) do (
-            echo Killing UserService PID %%P
             taskkill /F /PID %%P >nul 2>&1
           )
-
-          echo === Kill stage completed ===
           exit /b 0
         '''
       }
     }
 
-    // ----------------------------------------------------
-    // ✅ Build
-    // ----------------------------------------------------
-    stage('Build') {
+    // ====================================================
+    // ✅ CI PIPELINE STAGES
+    // ====================================================
+
+    stage('Compile') {
       steps {
         withEnv([
           "JAVA_HOME=${env.JDK_HOME}",
@@ -94,14 +81,52 @@ pipeline {
           "PATH+JAVA=${env.JDK_HOME}\\bin",
           "PATH+MAVEN=${env.MVN_HOME}\\bin"
         ]) {
-          bat 'call "%M2_HOME%\\bin\\mvn.cmd" -B clean package -DskipTests'
+          bat 'call "%M2_HOME%\\bin\\mvn.cmd" -B clean compile'
         }
       }
     }
 
-    // ----------------------------------------------------
-    // ✅ Run MULTIPLE instances (one per port)
-    // ----------------------------------------------------
+    stage('Unit Tests') {
+      steps {
+        withEnv([
+          "JAVA_HOME=${env.JDK_HOME}",
+          "M2_HOME=${env.MVN_HOME}",
+          "PATH+JAVA=${env.JDK_HOME}\\bin",
+          "PATH+MAVEN=${env.MVN_HOME}\\bin"
+        ]) {
+          bat 'call "%M2_HOME%\\bin\\mvn.cmd" -B test'
+        }
+      }
+    }
+
+    stage('SonarQube Scan') {
+      steps {
+        withSonarQubeEnv('SonarQube') {
+          withEnv([
+            "JAVA_HOME=${env.JDK_HOME}",
+            "M2_HOME=${env.MVN_HOME}",
+            "PATH+JAVA=${env.JDK_HOME}\\bin",
+            "PATH+MAVEN=${env.MVN_HOME}\\bin"
+          ]) {
+            bat 'call "%M2_HOME%\\bin\\mvn.cmd" -B verify sonar:sonar'
+          }
+        }
+      }
+    }
+
+    stage('Package / Build') {
+      steps {
+        withEnv([
+          "JAVA_HOME=${env.JDK_HOME}",
+          "M2_HOME=${env.MVN_HOME}",
+          "PATH+JAVA=${env.JDK_HOME}\\bin",
+          "PATH+MAVEN=${env.MVN_HOME}\\bin"
+        ]) {
+          bat 'call "%M2_HOME%\\bin\\mvn.cmd" -B package -DskipTests'
+        }
+      }
+    }
+
     stage('Run UserService (Multiple Instances)') {
       steps {
         bat '''
@@ -112,26 +137,20 @@ pipeline {
             set "JAR=%%~ff"
             goto :found
           )
-          echo No JAR found
-          exit /b 1
           :found
 
           if exist run rmdir /s /q run
           mkdir run
           copy /Y "%JAR%" run\\UserService.jar
 
-          rem Prevent Jenkins from killing processes
           set BUILD_ID=dontKillMe
           set JENKINS_NODE_COOKIE=do_not_kill
 
           for %%P in (%ALL_PORTS%) do (
-            echo Starting UserService on port %%P
             start "" /b "%JAVA_HOME%\\bin\\java.exe" ^
               -jar "%CD%\\run\\UserService.jar" ^
               --server.port=%%P
           )
-
-          echo All instances started.
           exit /b 0
         '''
       }
