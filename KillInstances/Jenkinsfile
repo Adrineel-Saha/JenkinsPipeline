@@ -1,22 +1,74 @@
 pipeline {
   agent any
 
-  /* ✅ STATIC PARAMETERS — ALWAYS VISIBLE */
+  /* =========================================================
+     ✅ PARAMETERS (PORTS ONLY FOR MICROSERVICES)
+     ========================================================= */
   parameters {
-    booleanParam(name: 'KILL_EUREKA',        defaultValue: false, description: 'Kill Eureka Server')
-    booleanParam(name: 'KILL_APIGATEWAY',    defaultValue: false, description: 'Kill API Gateway')
-    booleanParam(name: 'KILL_CONFIGSERVER',  defaultValue: false, description: 'Kill Config Server')
-    booleanParam(name: 'KILL_ORDERSERVICE',  defaultValue: false, description: 'Kill Order Service')
-    booleanParam(name: 'KILL_PRODUCTSERVICE',defaultValue: false, description: 'Kill Product Service')
-    booleanParam(name: 'KILL_USERSERVICE',   defaultValue: false, description: 'Kill User Service')
+
+    /* ---------- Infrastructure / Single-instance ---------- */
+    booleanParam(
+      name: 'KILL_EUREKA',
+      defaultValue: false,
+      description: 'Kill Eureka Server'
+    )
+
+    booleanParam(
+      name: 'KILL_APIGATEWAY',
+      defaultValue: false,
+      description: 'Kill API Gateway (single instance)'
+    )
+
+    booleanParam(
+      name: 'KILL_CONFIGSERVER',
+      defaultValue: false,
+      description: 'Kill Config Server (single instance)'
+    )
+
+    /* ---------- Microservices (multi-instance) ---------- */
+
+    booleanParam(
+      name: 'KILL_USERSERVICE',
+      defaultValue: false,
+      description: 'Kill User Service'
+    )
+    string(
+      name: 'USERSERVICE_PORTS',
+      defaultValue: '',
+      description: 'UserService ports (comma-separated). Empty = ALL'
+    )
+
+    booleanParam(
+      name: 'KILL_PRODUCTSERVICE',
+      defaultValue: false,
+      description: 'Kill Product Service'
+    )
+    string(
+      name: 'PRODUCTSERVICE_PORTS',
+      defaultValue: '',
+      description: 'ProductService ports (comma-separated). Empty = ALL'
+    )
+
+    booleanParam(
+      name: 'KILL_ORDERSERVICE',
+      defaultValue: false,
+      description: 'Kill Order Service'
+    )
+    string(
+      name: 'ORDERSERVICE_PORTS',
+      defaultValue: '',
+      description: 'OrderService ports (comma-separated). Empty = ALL'
+    )
   }
 
   stages {
 
+    /* ========================================================= */
     stage('Clean Workspace') {
       steps { deleteDir() }
     }
 
+    /* ========================================================= */
     stage('Clone EurekaServer Repo') {
       steps {
         dir('eureka') {
@@ -25,28 +77,41 @@ pipeline {
       }
     }
 
+    /* ========================================================= */
     stage('Read Eureka Port from application.yml') {
       steps {
         script {
           def yml = readFile('eureka/src/main/resources/application.yml')
           def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)/)
-          if (!m.find()) error 'server.port not found'
+          if (!m.find()) {
+            error 'server.port not found in Eureka application.yml'
+          }
           env.EUREKA_PORT = m.group(1)
           echo "✅ Eureka port = ${env.EUREKA_PORT}"
         }
       }
     }
 
+    /* ========================================================= */
     stage('Fetch Eureka Registry (XML)') {
       steps {
         bat 'curl -s http://localhost:%EUREKA_PORT%/eureka/apps > apps.xml'
       }
     }
 
+    /* ========================================================= */
     stage('Resolve Targets from Eureka Registry') {
       steps {
         script {
 
+          /* Port selection ONLY for microservices */
+          def portMap = [
+            USERSERVICE    : params.USERSERVICE_PORTS,
+            PRODUCTSERVICE : params.PRODUCTSERVICE_PORTS,
+            ORDERSERVICE   : params.ORDERSERVICE_PORTS
+          ]
+
+          /* Parse Eureka XML using PowerShell */
           writeFile file: 'resolve.ps1', text: '''
 [xml]$x = Get-Content "apps.xml"
 $targets = @()
@@ -68,13 +133,32 @@ $targets | Set-Content "targets.txt"
           if (fileExists('targets.txt')) {
             readFile('targets.txt').readLines().each { line ->
               def (app, id, port) = line.split('\\|')
-              if (
+
+              /* Check if kill checkbox enabled */
+              def killEnabled =
                 (app == 'USERSERVICE'      && params.KILL_USERSERVICE) ||
                 (app == 'PRODUCTSERVICE'   && params.KILL_PRODUCTSERVICE) ||
                 (app == 'ORDERSERVICE'     && params.KILL_ORDERSERVICE) ||
                 (app == 'APIGATEWAY'       && params.KILL_APIGATEWAY) ||
                 (app == 'CONFIGSERVER'     && params.KILL_CONFIGSERVER)
-              ) {
+
+              if (!killEnabled) return
+
+              /* Services WITHOUT ports (Gateway, Config) */
+              if (!portMap.containsKey(app)) {
+                finalTargets << line
+                return
+              }
+
+              /* Microservices WITH ports */
+              def selectedPorts = portMap[app]
+                ?.split(',')
+                *.trim()
+                .findAll { it.isInteger() }
+
+              if (!selectedPorts || selectedPorts.isEmpty()) {
+                finalTargets << line
+              } else if (selectedPorts.contains(port)) {
                 finalTargets << line
               }
             }
@@ -82,13 +166,14 @@ $targets | Set-Content "targets.txt"
 
           writeFile file: 'final_targets.txt', text: finalTargets.join('\n')
           env.HAS_APP_TARGETS = finalTargets ? 'yes' : ''
-          echo "✅ Final targets:"
+
+          echo '✅ Final targets selected:'
           finalTargets.each { echo it }
         }
       }
     }
 
-    /* ✅ FIXED STAGE */
+    /* ========================================================= */
     stage('Kill Application Processes') {
       when { expression { env.HAS_APP_TARGETS == 'yes' } }
       steps {
@@ -107,6 +192,7 @@ $targets | Set-Content "targets.txt"
       }
     }
 
+    /* ========================================================= */
     stage('Deregister Applications from Eureka') {
       when { expression { env.HAS_APP_TARGETS == 'yes' } }
       steps {
@@ -120,13 +206,17 @@ $targets | Set-Content "targets.txt"
       }
     }
 
+    /* ========================================================= */
     stage('Kill Eureka Server') {
       when { expression { params.KILL_EUREKA } }
       steps {
         bat '''
           for /f "tokens=5" %%P in (
             'netstat -ano ^| findstr LISTENING ^| findstr :%EUREKA_PORT%'
-          ) do taskkill /F /PID %%P >nul
+          ) do (
+            echo Killing Eureka PID %%P
+            taskkill /F /PID %%P >nul
+          )
           exit /b 0
         '''
       }
