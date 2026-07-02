@@ -1,0 +1,165 @@
+pipeline {
+  agent any
+
+  environment {
+    JDK_HOME = tool name: 'JDK17', type: 'jdk'
+    MVN_HOME = tool name: 'Maven3', type: 'maven'
+  }
+
+  parameters {
+    string(
+      name: 'EXTRA_PORTS',
+      defaultValue: '',
+      description: 'Additional ports (comma-separated). Example: 8085,8086'
+    )
+  }
+
+  stages {
+
+    stage('Clone Repository') {
+      steps {
+        git url: 'https://github.com/Adrineel-Saha/AuthService.git', branch: 'main'
+      }
+    }
+
+    stage('Read Port from application.yml') {
+      steps {
+        script {
+          def yml = readFile 'src/main/resources/application.yml'
+          def m = (yml =~ /(?m)^server:\s*(?:\r?\n|\r)\s*port:\s*(\d+)\s*$/)
+          if (!m.find()) {
+            error 'server.port not found in application.yml'
+          }
+          env.BASE_PORT = m.group(1)
+          echo "Base port from application.yml = ${env.BASE_PORT}"
+        }
+      }
+    }
+
+    stage('Resolve All Ports') {
+      steps {
+        script {
+          def ports = []
+          ports << env.BASE_PORT
+
+          if (params.EXTRA_PORTS?.trim()) {
+            params.EXTRA_PORTS.split(',')
+              .collect { it.trim() }
+              .findAll { it.isInteger() }
+              .each { ports << it }
+          }
+
+          env.ALL_PORTS = ports.unique().join(' ')
+          echo "All ports to use: ${env.ALL_PORTS}"
+        }
+      }
+    }
+
+    stage('Kill Old Instances') {
+      steps {
+        bat '''
+          @echo on
+          for /f "skip=1 tokens=2 delims== " %%P in (
+            'wmic process where "CommandLine like '%%AuthService.jar%%'" get ProcessId /value'
+          ) do (
+            taskkill /F /PID %%P >nul 2>&1
+          )
+          exit /b 0
+        '''
+      }
+    }
+
+    // ====================================================
+    // ✅ CI PIPELINE STAGES
+    // ====================================================
+
+    stage('Compile') {
+      steps {
+        withEnv([
+          "JAVA_HOME=${env.JDK_HOME}",
+          "M2_HOME=${env.MVN_HOME}",
+          "PATH+JAVA=${env.JDK_HOME}\\bin",
+          "PATH+MAVEN=${env.MVN_HOME}\\bin"
+        ]) {
+          bat 'call "%M2_HOME%\\bin\\mvn.cmd" -B clean compile'
+        }
+      }
+    }
+
+    stage('Unit Tests') {
+      steps {
+        withEnv([
+          "JAVA_HOME=${env.JDK_HOME}",
+          "M2_HOME=${env.MVN_HOME}",
+          "PATH+JAVA=${env.JDK_HOME}\\bin",
+          "PATH+MAVEN=${env.MVN_HOME}\\bin"
+        ]) {
+          bat 'call "%M2_HOME%\\bin\\mvn.cmd" -B test'
+        }
+      }
+    }
+
+    stage('SonarQube Scan') {
+      steps {
+        withSonarQubeEnv('SonarQube') {
+          withEnv([
+            "JAVA_HOME=${env.JDK_HOME}",
+            "M2_HOME=${env.MVN_HOME}",
+            "PATH+JAVA=${env.JDK_HOME}\\bin",
+            "PATH+MAVEN=${env.MVN_HOME}\\bin"
+          ]) {
+            bat 'call "%M2_HOME%\\bin\\mvn.cmd" -B verify sonar:sonar'
+          }
+        }
+      }
+    }
+
+    stage('Package / Build') {
+      steps {
+        withEnv([
+          "JAVA_HOME=${env.JDK_HOME}",
+          "M2_HOME=${env.MVN_HOME}",
+          "PATH+JAVA=${env.JDK_HOME}\\bin",
+          "PATH+MAVEN=${env.MVN_HOME}\\bin"
+        ]) {
+          bat 'call "%M2_HOME%\\bin\\mvn.cmd" -B package -DskipTests'
+        }
+      }
+    }
+
+    stage('Run AuthService (Multiple Instances)') {
+      steps {
+        bat '''
+          @echo on
+          setlocal enabledelayedexpansion
+
+          for %%f in (target\\*.jar) do (
+            set "JAR=%%~ff"
+            goto :found
+          )
+          :found
+
+          if exist run rmdir /s /q run
+          mkdir run
+          copy /Y "%JAR%" run\\AuthService.jar
+
+          set BUILD_ID=dontKillMe
+          set JENKINS_NODE_COOKIE=do_not_kill
+
+          for %%P in (%ALL_PORTS%) do (
+            start "" /b "%JAVA_HOME%\\bin\\java.exe" ^
+              -jar "%CD%\\run\\AuthService.jar" ^
+              --server.port=%%P
+          )
+          exit /b 0
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      echo "✅ AuthService instances running on ports: ${env.ALL_PORTS}"
+    }
+  }
+}
