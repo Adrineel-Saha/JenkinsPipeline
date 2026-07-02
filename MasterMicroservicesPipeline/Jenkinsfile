@@ -5,6 +5,7 @@ pipeline {
         string(name: 'USER_EXTRA_PORTS',    defaultValue: '', description: 'UserService extra ports')
         string(name: 'PRODUCT_EXTRA_PORTS', defaultValue: '', description: 'ProductService extra ports')
         string(name: 'ORDER_EXTRA_PORTS',   defaultValue: '', description: 'OrderService extra ports')
+		string(name: 'AUTH_EXTRA_PORTS',   defaultValue: '', description: 'AuthService extra ports')
     }
 
     stages {
@@ -48,6 +49,17 @@ pipeline {
                 build job: 'OrderService-Pipeline',
                       parameters: [
                           string(name: 'EXTRA_PORTS', value: params.ORDER_EXTRA_PORTS)
+                      ],
+                      wait: true,
+                      propagate: true
+            }
+        }
+		
+		stage('Run AuthService-Pipeline') {
+            steps {
+                build job: 'AuthService-Pipeline',
+                      parameters: [
+                          string(name: 'EXTRA_PORTS', value: params.AUTH_EXTRA_PORTS)
                       ],
                       wait: true,
                       propagate: true
