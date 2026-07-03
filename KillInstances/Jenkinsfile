@@ -21,6 +21,9 @@ pipeline {
 
     booleanParam(name: 'KILL_ORDERSERVICE', defaultValue: false, description: 'Kill Order Service')
     string(name: 'ORDERSERVICE_PORTS', defaultValue: '', description: 'OrderService ports (comma-separated). Empty = ALL')
+	
+	booleanParam(name: 'KILL_AUTHSERVICE', defaultValue: false, description: 'Kill Auth Service')
+    string(name: 'AUTHSERVICE_PORTS', defaultValue: '', description: 'AuthService ports (comma-separated). Empty = ALL')
   }
 
   stages {
@@ -72,7 +75,8 @@ pipeline {
           def portMap = [
             USERSERVICE    : params.USERSERVICE_PORTS,
             PRODUCTSERVICE : params.PRODUCTSERVICE_PORTS,
-            ORDERSERVICE   : params.ORDERSERVICE_PORTS
+            ORDERSERVICE   : params.ORDERSERVICE_PORTS,
+			AUTHSERVICE    : params.AUTHSERVICE_PORTS
           ]
 
           /* Always create targets.txt (even if empty) */
@@ -109,6 +113,7 @@ $targets | Set-Content "targets.txt"
                 (app == 'USERSERVICE'      && params.KILL_USERSERVICE) ||
                 (app == 'PRODUCTSERVICE'   && params.KILL_PRODUCTSERVICE) ||
                 (app == 'ORDERSERVICE'     && params.KILL_ORDERSERVICE) ||
+				(app == 'AUTHSERVICE'     && params.KILL_AUTHSERVICE) ||
                 (app == 'APIGATEWAY'       && params.KILL_APIGATEWAY) ||
                 (app == 'CONFIGSERVER'     && params.KILL_CONFIGSERVER)
 
